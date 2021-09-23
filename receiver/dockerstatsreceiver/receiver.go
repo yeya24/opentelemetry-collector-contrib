@@ -19,27 +19,32 @@ import (
 	"fmt"
 	"net/url"
 	"sync"
+	"time"
 
-	agentmetricspb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/metrics/v1"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/model/pdata"
 	"go.opentelemetry.io/collector/obsreport"
-	"go.opentelemetry.io/collector/translator/internaldata"
 	"go.uber.org/zap"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/redisreceiver/interval"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/docker"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/interval"
 )
 
 var _ component.MetricsReceiver = (*Receiver)(nil)
 var _ interval.Runnable = (*Receiver)(nil)
 
+const (
+	defaultDockerAPIVersion         = 1.22
+	minimalRequiredDockerAPIVersion = 1.22
+)
+
 type Receiver struct {
 	config            *Config
 	logger            *zap.Logger
 	nextConsumer      consumer.Metrics
-	client            *dockerClient
+	client            *docker.Client
 	runner            *interval.Runner
-	obsCtx            context.Context
 	runnerCtx         context.Context
 	runnerCancel      context.CancelFunc
 	successfullySetup bool
@@ -75,13 +80,15 @@ func NewReceiver(
 }
 
 func (r *Receiver) Start(ctx context.Context, host component.Host) error {
-	var err error
-	r.client, err = newDockerClient(r.config, r.logger)
+	dConfig, err := docker.NewConfig(r.config.Endpoint, r.config.Timeout, r.config.ExcludedImages, r.config.DockerAPIVersion)
 	if err != nil {
 		return err
 	}
 
-	r.obsCtx = obsreport.ReceiverContext(ctx, r.config.ID(), r.transport)
+	r.client, err = docker.NewDockerClient(dConfig, r.logger)
+	if err != nil {
+		return err
+	}
 
 	r.runnerCtx, r.runnerCancel = context.WithCancel(context.Background())
 	r.runner = interval.NewRunner(r.config.CollectionInterval, r)
@@ -113,7 +120,7 @@ func (r *Receiver) Setup() error {
 }
 
 type result struct {
-	md  *agentmetricspb.ExportMetricsServiceRequest
+	md  pdata.Metrics
 	err error
 }
 
@@ -122,7 +129,7 @@ func (r *Receiver) Run() error {
 		return r.Setup()
 	}
 
-	c := r.obsrecv.StartMetricsOp(r.obsCtx)
+	ctx := r.obsrecv.StartMetricsOp(r.runnerCtx)
 
 	containers := r.client.Containers()
 	results := make(chan result, len(containers))
@@ -130,10 +137,24 @@ func (r *Receiver) Run() error {
 	wg := &sync.WaitGroup{}
 	wg.Add(len(containers))
 	for _, container := range containers {
-		go func(dc DockerContainer) {
-			md, err := r.client.FetchContainerStatsAndConvertToMetrics(r.runnerCtx, dc)
+		go func(c docker.Container) {
+			defer wg.Done()
+			statsJSON, err := r.client.FetchContainerStatsAsJSON(ctx, c)
+			if err != nil {
+				results <- result{pdata.NewMetrics(), err}
+				return
+			}
+
+			md, err := ContainerStatsToMetrics(pdata.NewTimestampFromTime(time.Now()), statsJSON, c, r.config)
+			if err != nil {
+				r.logger.Error(
+					"Could not convert docker containerStats for container id",
+					zap.String("id", c.ID),
+					zap.Error(err),
+				)
+			}
+
 			results <- result{md, err}
-			wg.Done()
 		}(container)
 	}
 
@@ -142,15 +163,14 @@ func (r *Receiver) Run() error {
 
 	numPoints := 0
 	var lastErr error
-	for result := range results {
+	for res := range results {
 		var err error
-		if result.md != nil {
-			md := internaldata.OCToMetrics(result.md.Node, result.md.Resource, result.md.Metrics)
-			_, np := md.MetricAndDataPointCount()
-			numPoints += np
-			err = r.nextConsumer.ConsumeMetrics(r.runnerCtx, md)
+		currentNumPoints := res.md.DataPointCount()
+		if currentNumPoints != 0 {
+			numPoints += currentNumPoints
+			err = r.nextConsumer.ConsumeMetrics(ctx, res.md)
 		} else {
-			err = result.err
+			err = res.err
 		}
 
 		if err != nil {
@@ -158,6 +178,6 @@ func (r *Receiver) Run() error {
 		}
 	}
 
-	r.obsrecv.EndMetricsOp(c, typeStr, numPoints, lastErr)
+	r.obsrecv.EndMetricsOp(ctx, typeStr, numPoints, lastErr)
 	return nil
 }

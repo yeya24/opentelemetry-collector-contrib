@@ -24,12 +24,13 @@ import (
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/config/configtest"
-	"go.opentelemetry.io/collector/exporter/jaegerexporter"
 	"go.opentelemetry.io/collector/exporter/otlpexporter"
-	"go.opentelemetry.io/collector/exporter/prometheusexporter"
 	"go.opentelemetry.io/collector/processor/batchprocessor"
-	"go.opentelemetry.io/collector/receiver/jaegerreceiver"
 	"go.opentelemetry.io/collector/receiver/otlpreceiver"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/jaegerexporter"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusexporter"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/jaegerreceiver"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -46,6 +47,8 @@ func TestLoadConfig(t *testing.T) {
 			configFile:          "config-full.yaml",
 			wantMetricsExporter: "otlp/spanmetrics",
 			wantLatencyHistogramBuckets: []time.Duration{
+				100 * time.Microsecond,
+				1 * time.Millisecond,
 				2 * time.Millisecond,
 				6 * time.Millisecond,
 				10 * time.Millisecond,

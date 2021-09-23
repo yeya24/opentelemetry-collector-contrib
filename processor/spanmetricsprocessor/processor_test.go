@@ -24,12 +24,13 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/config/configgrpc"
 	"go.opentelemetry.io/collector/consumer/consumertest"
-	"go.opentelemetry.io/collector/consumer/pdata"
 	"go.opentelemetry.io/collector/exporter/otlpexporter"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"go.opentelemetry.io/collector/model/pdata"
+	conventions "go.opentelemetry.io/collector/model/semconv/v1.5.0"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/metadata"
 
@@ -47,8 +48,8 @@ const (
 	notInSpanAttrName0 = "shouldBeInMetric"
 	notInSpanAttrName1 = "shouldNotBeInMetric"
 
-	sampleLatency         = 11
-	sampleLatencyDuration = sampleLatency * time.Millisecond
+	sampleLatency         = float64(11)
+	sampleLatencyDuration = time.Duration(sampleLatency) * time.Millisecond
 )
 
 // metricID represents the minimum attributes that uniquely identifies a metric in our tests.
@@ -60,7 +61,7 @@ type metricID struct {
 }
 
 type metricDataPoint interface {
-	LabelsMap() pdata.StringMap
+	Attributes() pdata.AttributeMap
 }
 
 type serviceSpans struct {
@@ -103,7 +104,7 @@ func TestProcessorStart(t *testing.T) {
 			cfg := factory.CreateDefaultConfig().(*Config)
 			cfg.MetricsExporter = tc.metricsExporter
 
-			procCreationParams := component.ProcessorCreateSettings{Logger: zap.NewNop()}
+			procCreationParams := componenttest.NewNopProcessorCreateSettings()
 			traceProcessor, err := factory.CreateTracesProcessor(context.Background(), procCreationParams, cfg, consumertest.NewNop())
 			require.NoError(t, err)
 
@@ -134,6 +135,27 @@ func TestProcessorShutdown(t *testing.T) {
 
 	// Verify
 	assert.NoError(t, err)
+}
+
+func TestConfigureLatencyBounds(t *testing.T) {
+	// Prepare
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.LatencyHistogramBuckets = []time.Duration{
+		3 * time.Nanosecond,
+		3 * time.Microsecond,
+		3 * time.Millisecond,
+		3 * time.Second,
+	}
+
+	// Test
+	next := new(consumertest.TracesSink)
+	p, err := newProcessor(zap.NewNop(), cfg, next)
+
+	// Verify
+	assert.NoError(t, err)
+	assert.NotNil(t, p)
+	assert.Equal(t, []float64{0.000003, 0.003, 3, 3000, maxDurationMs}, p.latencyBounds)
 }
 
 func TestProcessorCapabilities(t *testing.T) {
@@ -235,7 +257,7 @@ func TestMetricKeyCache(t *testing.T) {
 	// Validate
 	require.NoError(t, err)
 
-	origKeyCache := make(map[metricKey]dimKV)
+	origKeyCache := make(map[metricKey]pdata.AttributeMap)
 	for k, v := range p.metricKeyToDimensions {
 		origKeyCache[k] = v
 	}
@@ -271,12 +293,13 @@ func newProcessorImp(mexp *mocks.MetricsExporter, tcon *mocks.TracesConsumer, de
 		metricsExporter: mexp,
 		nextConsumer:    tcon,
 
-		startTime:           time.Now(),
-		callSum:             make(map[metricKey]int64),
-		latencySum:          make(map[metricKey]float64),
-		latencyCount:        make(map[metricKey]uint64),
-		latencyBucketCounts: make(map[metricKey][]uint64),
-		latencyBounds:       defaultLatencyHistogramBucketsMs,
+		startTime:            time.Now(),
+		callSum:              make(map[metricKey]int64),
+		latencySum:           make(map[metricKey]float64),
+		latencyCount:         make(map[metricKey]uint64),
+		latencyBucketCounts:  make(map[metricKey][]uint64),
+		latencyBounds:        defaultLatencyHistogramBucketsMs,
+		latencyExemplarsData: make(map[metricKey][]exemplarData),
 		dimensions: []Dimension{
 			// Set nil defaults to force a lookup for the attribute in the span.
 			{stringAttrName, nil},
@@ -291,7 +314,7 @@ func newProcessorImp(mexp *mocks.MetricsExporter, tcon *mocks.TracesConsumer, de
 			// Leave the default value unset to test that this dimension should not be added to the metric.
 			{notInSpanAttrName1, nil},
 		},
-		metricKeyToDimensions: make(map[metricKey]dimKV),
+		metricKeyToDimensions: make(map[metricKey]pdata.AttributeMap),
 	}
 }
 
@@ -319,7 +342,7 @@ func verifyConsumeMetricsInput(input pdata.Metrics, t *testing.T) bool {
 	for ; mi < 3; mi++ {
 		assert.Equal(t, "calls_total", m.At(mi).Name())
 
-		data := m.At(mi).IntSum()
+		data := m.At(mi).Sum()
 		assert.Equal(t, pdata.AggregationTemporalityCumulative, data.AggregationTemporality())
 		assert.True(t, data.IsMonotonic())
 
@@ -327,7 +350,7 @@ func verifyConsumeMetricsInput(input pdata.Metrics, t *testing.T) bool {
 		require.Equal(t, 1, dps.Len())
 
 		dp := dps.At(0)
-		assert.Equal(t, int64(1), dp.Value(), "There should only be one metric per Service/operation/kind combination")
+		assert.Equal(t, int64(1), dp.IntVal(), "There should only be one metric per Service/operation/kind combination")
 		assert.NotZero(t, dp.StartTimestamp(), "StartTimestamp should be set")
 		assert.NotZero(t, dp.Timestamp(), "Timestamp should be set")
 
@@ -339,14 +362,14 @@ func verifyConsumeMetricsInput(input pdata.Metrics, t *testing.T) bool {
 	for ; mi < m.Len(); mi++ {
 		assert.Equal(t, "latency", m.At(mi).Name())
 
-		data := m.At(mi).IntHistogram()
+		data := m.At(mi).Histogram()
 		assert.Equal(t, pdata.AggregationTemporalityCumulative, data.AggregationTemporality())
 
 		dps := data.DataPoints()
 		require.Equal(t, 1, dps.Len())
 
 		dp := dps.At(0)
-		assert.Equal(t, int64(sampleLatency), dp.Sum(), "Should be a single 11ms latency measurement")
+		assert.Equal(t, sampleLatency, dp.Sum(), "Should be a single 11ms latency measurement")
 		assert.NotZero(t, dp.Timestamp(), "Timestamp should be set")
 
 		// Verify bucket counts. Firstly, find the bucket index where the 11ms latency should belong in.
@@ -373,26 +396,26 @@ func verifyConsumeMetricsInput(input pdata.Metrics, t *testing.T) bool {
 
 func verifyMetricLabels(dp metricDataPoint, t *testing.T, seenMetricIDs map[metricID]bool) {
 	mID := metricID{}
-	wantDimensions := map[string]string{
-		stringAttrName:     "stringAttrValue",
-		intAttrName:        "99",
-		doubleAttrName:     "99.99",
-		boolAttrName:       "true",
-		nullAttrName:       "",
-		arrayAttrName:      "[]",
-		mapAttrName:        "{}",
-		notInSpanAttrName0: "defaultNotInSpanAttrVal",
+	wantDimensions := map[string]pdata.AttributeValue{
+		stringAttrName:     pdata.NewAttributeValueString("stringAttrValue"),
+		intAttrName:        pdata.NewAttributeValueInt(99),
+		doubleAttrName:     pdata.NewAttributeValueDouble(99.99),
+		boolAttrName:       pdata.NewAttributeValueBool(true),
+		nullAttrName:       pdata.NewAttributeValueEmpty(),
+		arrayAttrName:      pdata.NewAttributeValueArray(),
+		mapAttrName:        pdata.NewAttributeValueMap(),
+		notInSpanAttrName0: pdata.NewAttributeValueString("defaultNotInSpanAttrVal"),
 	}
-	dp.LabelsMap().Range(func(k string, v string) bool {
+	dp.Attributes().Range(func(k string, v pdata.AttributeValue) bool {
 		switch k {
 		case serviceNameKey:
-			mID.service = v
+			mID.service = v.StringVal()
 		case operationKey:
-			mID.operation = v
+			mID.operation = v.StringVal()
 		case spanKindKey:
-			mID.kind = v
+			mID.kind = v.StringVal()
 		case statusCodeKey:
-			mID.statusCode = v
+			mID.statusCode = v.StringVal()
 		case notInSpanAttrName1:
 			assert.Fail(t, notInSpanAttrName1+" should not be in this metric")
 		default:
@@ -463,8 +486,8 @@ func initSpan(span span, s pdata.Span) {
 	s.SetKind(span.kind)
 	s.Status().SetCode(span.statusCode)
 	now := time.Now()
-	s.SetStartTimestamp(pdata.TimestampFromTime(now))
-	s.SetEndTimestamp(pdata.TimestampFromTime(now.Add(sampleLatencyDuration)))
+	s.SetStartTimestamp(pdata.NewTimestampFromTime(now))
+	s.SetEndTimestamp(pdata.NewTimestampFromTime(now.Add(sampleLatencyDuration)))
 	s.Attributes().InsertString(stringAttrName, "stringAttrValue")
 	s.Attributes().InsertInt(intAttrName, 99)
 	s.Attributes().InsertDouble(doubleAttrName, 99.99)
@@ -472,6 +495,7 @@ func initSpan(span span, s pdata.Span) {
 	s.Attributes().InsertNull(nullAttrName)
 	s.Attributes().Insert(mapAttrName, pdata.NewAttributeValueMap())
 	s.Attributes().Insert(arrayAttrName, pdata.NewAttributeValueArray())
+	s.SetTraceID(pdata.NewTraceID([16]byte{byte(42)}))
 }
 
 func newOTLPExporters(t *testing.T) (*otlpexporter.Config, component.MetricsExporter, component.TracesExporter) {
@@ -482,7 +506,7 @@ func newOTLPExporters(t *testing.T) (*otlpexporter.Config, component.MetricsExpo
 			Endpoint: "example.com:1234",
 		},
 	}
-	expCreationParams := component.ExporterCreateSettings{Logger: zap.NewNop()}
+	expCreationParams := componenttest.NewNopExporterCreateSettings()
 	mexp, err := otlpExpFactory.CreateMetricsExporter(context.Background(), expCreationParams, otlpConfig)
 	require.NoError(t, err)
 	texp, err := otlpExpFactory.CreateTracesExporter(context.Background(), expCreationParams, otlpConfig)
@@ -589,4 +613,48 @@ func TestSanitize(t *testing.T) {
 	require.Equal(t, "key_0test", sanitize("0test"))
 	require.Equal(t, "test", sanitize("test"))
 	require.Equal(t, "test__", sanitize("test_/"))
+}
+
+func TestSetLatencyExemplars(t *testing.T) {
+	// ----- conditions -------------------------------------------------------
+	traces := buildSampleTrace()
+	traceID := traces.ResourceSpans().At(0).InstrumentationLibrarySpans().At(0).Spans().At(0).TraceID()
+	exemplarSlice := pdata.NewExemplarSlice()
+	timestamp := pdata.NewTimestampFromTime(time.Now())
+	value := float64(42)
+
+	ed := []exemplarData{{traceID: traceID, value: value}}
+
+	// ----- call -------------------------------------------------------------
+	setLatencyExemplars(ed, timestamp, exemplarSlice)
+
+	// ----- verify -----------------------------------------------------------
+	traceIDValue, exist := exemplarSlice.At(0).FilteredAttributes().Get(traceIDKey)
+
+	assert.NotEmpty(t, exemplarSlice)
+	assert.True(t, exist)
+	assert.Equal(t, traceIDValue.AsString(), traceID.HexString())
+	assert.Equal(t, exemplarSlice.At(0).Timestamp(), timestamp)
+	assert.Equal(t, exemplarSlice.At(0).DoubleVal(), value)
+}
+
+func TestProcessorUpdateLatencyExemplars(t *testing.T) {
+	// ----- conditions -------------------------------------------------------
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
+	traces := buildSampleTrace()
+	traceID := traces.ResourceSpans().At(0).InstrumentationLibrarySpans().At(0).Spans().At(0).TraceID()
+	key := metricKey("metricKey")
+	next := new(consumertest.TracesSink)
+	p, err := newProcessor(zap.NewNop(), cfg, next)
+	value := float64(42)
+	index := 12
+
+	// ----- call -------------------------------------------------------------
+	p.updateLatencyExemplars(key, value, index, traceID)
+
+	// ----- verify -----------------------------------------------------------
+	assert.NoError(t, err)
+	assert.NotEmpty(t, p.latencyExemplarsData[key])
+	assert.Equal(t, p.latencyExemplarsData[key][index], exemplarData{traceID: traceID, value: value})
 }

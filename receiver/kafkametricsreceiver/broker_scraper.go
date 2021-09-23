@@ -22,12 +22,11 @@ import (
 	"github.com/Shopify/sarama"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/consumer/simple"
-	"go.opentelemetry.io/collector/receiver/scraperhelper"
+	"go.opentelemetry.io/collector/model/pdata"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkametricsreceiver/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/scraperhelper"
 )
 
 type brokerScraper struct {
@@ -59,18 +58,16 @@ func (s *brokerScraper) shutdown(context.Context) error {
 
 func (s *brokerScraper) scrape(context.Context) (pdata.ResourceMetricsSlice, error) {
 	brokers := s.client.Brokers()
-	metrics := simple.Metrics{
-		Metrics:                    pdata.NewMetrics(),
-		Timestamp:                  time.Now(),
-		MetricFactoriesByName:      metadata.M.FactoriesByName(),
-		InstrumentationLibraryName: instrumentationLibName,
-	}
-	metrics.AddGaugeDataPoint(metadata.M.KafkaBrokers.Name(), int64(len(brokers)))
 
-	return metrics.Metrics.ResourceMetrics(), nil
+	rms := pdata.NewResourceMetricsSlice()
+	ilm := rms.AppendEmpty().InstrumentationLibraryMetrics().AppendEmpty()
+	ilm.InstrumentationLibrary().SetName(instrumentationLibName)
+	addIntGauge(ilm.Metrics(), metadata.M.KafkaBrokers.Name(), pdata.NewTimestampFromTime(time.Now()), pdata.NewAttributeMap(), int64(len(brokers)))
+
+	return rms, nil
 }
 
-func createBrokerScraper(_ context.Context, cfg Config, saramaConfig *sarama.Config, logger *zap.Logger) (scraperhelper.ResourceMetricsScraper, error) {
+func createBrokerScraper(_ context.Context, cfg Config, saramaConfig *sarama.Config, logger *zap.Logger) (scraperhelper.Scraper, error) {
 	s := brokerScraper{
 		logger:       logger,
 		config:       cfg,

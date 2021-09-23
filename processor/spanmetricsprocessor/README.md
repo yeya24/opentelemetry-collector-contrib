@@ -78,7 +78,7 @@ processors:
   batch:
   spanmetrics:
     metrics_exporter: otlp/spanmetrics
-    latency_histogram_buckets: [2ms, 6ms, 10ms, 100ms, 250ms]
+    latency_histogram_buckets: [100us, 1ms, 2ms, 6ms, 10ms, 100ms, 250ms]
     dimensions:
       - name: http.method
         default: GET
@@ -90,7 +90,8 @@ exporters:
 
   otlp/spanmetrics:
     endpoint: "localhost:55677"
-    insecure: true
+    tls:
+      insecure: true
 
   prometheus:
     endpoint: "0.0.0.0:8889"

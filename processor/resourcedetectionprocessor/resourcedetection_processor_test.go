@@ -28,10 +28,9 @@ import (
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/consumer/consumertest"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/internaldata"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/model/pdata"
 
+	internaldata "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/opencensus"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/env"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/gcp/gce"
@@ -41,9 +40,9 @@ type MockDetector struct {
 	mock.Mock
 }
 
-func (p *MockDetector) Detect(ctx context.Context) (pdata.Resource, error) {
+func (p *MockDetector) Detect(ctx context.Context) (resource pdata.Resource, schemaURL string, err error) {
 	args := p.Called()
-	return args.Get(0).(pdata.Resource), args.Error(1)
+	return args.Get(0).(pdata.Resource), "", args.Error(1)
 }
 
 func TestResourceProcessor(t *testing.T) {
@@ -177,9 +176,9 @@ func TestResourceProcessor(t *testing.T) {
 				Timeout:           time.Second,
 			}
 
-			// Test trace consuner
+			// Test trace consumer
 			ttn := new(consumertest.TracesSink)
-			rtp, err := factory.createTracesProcessor(context.Background(), component.ProcessorCreateSettings{Logger: zap.NewNop()}, cfg, ttn)
+			rtp, err := factory.createTracesProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, ttn)
 
 			if tt.expectedNewError != "" {
 				assert.EqualError(t, err, tt.expectedNewError)
@@ -212,7 +211,7 @@ func TestResourceProcessor(t *testing.T) {
 
 			// Test metrics consumer
 			tmn := new(consumertest.MetricsSink)
-			rmp, err := factory.createMetricsProcessor(context.Background(), component.ProcessorCreateSettings{Logger: zap.NewNop()}, cfg, tmn)
+			rmp, err := factory.createMetricsProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, tmn)
 
 			if tt.expectedNewError != "" {
 				assert.EqualError(t, err, tt.expectedNewError)
@@ -243,7 +242,7 @@ func TestResourceProcessor(t *testing.T) {
 
 			// Test logs consumer
 			tln := new(consumertest.LogsSink)
-			rlp, err := factory.createLogsProcessor(context.Background(), component.ProcessorCreateSettings{Logger: zap.NewNop()}, cfg, tln)
+			rlp, err := factory.createLogsProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, tln)
 
 			if tt.expectedNewError != "" {
 				assert.EqualError(t, err, tt.expectedNewError)
@@ -294,7 +293,7 @@ func oCensusResource(res pdata.Resource) *resourcepb.Resource {
 func benchmarkConsumeTraces(b *testing.B, cfg *Config) {
 	factory := NewFactory()
 	sink := new(consumertest.TracesSink)
-	processor, _ := factory.CreateTracesProcessor(context.Background(), component.ProcessorCreateSettings{Logger: zap.NewNop()}, cfg, sink)
+	processor, _ := factory.CreateTracesProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, sink)
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -316,7 +315,7 @@ func BenchmarkConsumeTracesAll(b *testing.B) {
 func benchmarkConsumeMetrics(b *testing.B, cfg *Config) {
 	factory := NewFactory()
 	sink := new(consumertest.MetricsSink)
-	processor, _ := factory.CreateMetricsProcessor(context.Background(), component.ProcessorCreateSettings{Logger: zap.NewNop()}, cfg, sink)
+	processor, _ := factory.CreateMetricsProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, sink)
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -338,7 +337,7 @@ func BenchmarkConsumeMetricsAll(b *testing.B) {
 func benchmarkConsumeLogs(b *testing.B, cfg *Config) {
 	factory := NewFactory()
 	sink := new(consumertest.LogsSink)
-	processor, _ := factory.CreateLogsProcessor(context.Background(), component.ProcessorCreateSettings{Logger: zap.NewNop()}, cfg, sink)
+	processor, _ := factory.CreateLogsProcessor(context.Background(), componenttest.NewNopProcessorCreateSettings(), cfg, sink)
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {

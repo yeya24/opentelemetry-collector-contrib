@@ -42,12 +42,9 @@ func createDefaultConfig() config.Receiver {
 		HTTPServerSettings: confighttp.HTTPServerSettings{
 			Endpoint: "0.0.0.0:8086",
 		},
-		MetricsSchema: "telegraf-prometheus-v1",
 	}
 }
 
 func createMetricsReceiver(_ context.Context, params component.ReceiverCreateSettings, cfg config.Receiver, nextConsumer consumer.Metrics) (component.MetricsReceiver, error) {
-	influxLogger := newZapInfluxLogger(params.Logger)
-
-	return newMetricsReceiver(cfg.(*Config), influxLogger, nextConsumer)
+	return newMetricsReceiver(cfg.(*Config), params.TelemetrySettings, nextConsumer)
 }

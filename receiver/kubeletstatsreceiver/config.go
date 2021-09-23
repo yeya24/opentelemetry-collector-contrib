@@ -27,7 +27,7 @@ import (
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/k8sconfig"
 	kube "github.com/open-telemetry/opentelemetry-collector-contrib/internal/kubelet"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kubeletstatsreceiver/kubelet"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kubeletstatsreceiver/internal/kubelet"
 )
 
 var _ config.Receiver = (*Config)(nil)
@@ -96,7 +96,7 @@ func getMapFromSlice(collect []kubelet.MetricGroup) (map[kubelet.MetricGroup]boo
 	return out, nil
 }
 
-func (cfg *Config) Unmarshal(componentParser *configparser.Parser) error {
+func (cfg *Config) Unmarshal(componentParser *configparser.ConfigMap) error {
 	if componentParser == nil {
 		// Nothing to do if there is no config given.
 		return nil

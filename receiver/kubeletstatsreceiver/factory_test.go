@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !windows
 // +build !windows
+
 // TODO review if tests should succeed on Windows
 
 package kubeletstatsreceiver
@@ -24,17 +26,17 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenterror"
-	"go.opentelemetry.io/collector/config/configcheck"
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/configparser"
+	"go.opentelemetry.io/collector/config/configtest"
 	"go.opentelemetry.io/collector/config/configtls"
-	"go.opentelemetry.io/collector/testbed/testbed"
+	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/k8sconfig"
 	kube "github.com/open-telemetry/opentelemetry-collector-contrib/internal/kubelet"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kubeletstatsreceiver/kubelet"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kubeletstatsreceiver/internal/kubelet"
 )
 
 func TestType(t *testing.T) {
@@ -45,7 +47,7 @@ func TestType(t *testing.T) {
 
 func TestValidConfig(t *testing.T) {
 	factory := NewFactory()
-	err := configcheck.ValidateConfig(factory.CreateDefaultConfig())
+	err := configtest.CheckConfigStruct(factory.CreateDefaultConfig())
 	require.NoError(t, err)
 }
 
@@ -53,7 +55,7 @@ func TestCreateTracesReceiver(t *testing.T) {
 	factory := NewFactory()
 	traceReceiver, err := factory.CreateTracesReceiver(
 		context.Background(),
-		component.ReceiverCreateSettings{Logger: zap.NewNop()},
+		componenttest.NewNopReceiverCreateSettings(),
 		factory.CreateDefaultConfig(),
 		nil,
 	)
@@ -65,9 +67,9 @@ func TestCreateMetricsReceiver(t *testing.T) {
 	factory := NewFactory()
 	metricsReceiver, err := factory.CreateMetricsReceiver(
 		context.Background(),
-		component.ReceiverCreateSettings{Logger: zap.NewNop()},
+		componenttest.NewNopReceiverCreateSettings(),
 		tlsConfig(),
-		&testbed.MockMetricConsumer{},
+		consumertest.NewNop(),
 	)
 	require.NoError(t, err)
 	require.NotNil(t, metricsReceiver)
@@ -80,9 +82,9 @@ func TestFactoryInvalidExtraMetadataLabels(t *testing.T) {
 	}
 	metricsReceiver, err := factory.CreateMetricsReceiver(
 		context.Background(),
-		component.ReceiverCreateSettings{Logger: zap.NewNop()},
+		componenttest.NewNopReceiverCreateSettings(),
 		&cfg,
-		&testbed.MockMetricConsumer{},
+		consumertest.NewNop(),
 	)
 	require.Error(t, err)
 	require.Equal(t, "label \"invalid-label\" is not supported", err.Error())
@@ -100,9 +102,9 @@ func TestFactoryBadAuthType(t *testing.T) {
 	}
 	_, err := factory.CreateMetricsReceiver(
 		context.Background(),
-		component.ReceiverCreateSettings{Logger: zap.NewNop()},
+		componenttest.NewNopReceiverCreateSettings(),
 		cfg,
-		&testbed.MockMetricConsumer{},
+		consumertest.NewNop(),
 	)
 	require.Error(t, err)
 }
@@ -136,7 +138,7 @@ func tlsConfig() *Config {
 
 func TestCustomUnmarshaller(t *testing.T) {
 	type args struct {
-		componentParser *configparser.Parser
+		componentParser *configparser.ConfigMap
 		intoCfg         *Config
 	}
 	tests := []struct {
@@ -154,14 +156,14 @@ func TestCustomUnmarshaller(t *testing.T) {
 		{
 			name: "Fail initial unmarshal",
 			args: args{
-				componentParser: configparser.NewParser(),
+				componentParser: configparser.NewConfigMap(),
 			},
 			wantErr: true,
 		},
 		{
 			name: "metric_group unset",
 			args: args{
-				componentParser: configparser.NewParser(),
+				componentParser: configparser.NewConfigMap(),
 				intoCfg:         &Config{},
 			},
 			result: &Config{
@@ -171,7 +173,7 @@ func TestCustomUnmarshaller(t *testing.T) {
 		{
 			name: "fail to unmarshall metric_groups",
 			args: args{
-				componentParser: configparser.NewParser(),
+				componentParser: configparser.NewConfigMap(),
 				intoCfg:         &Config{},
 			},
 			mockUnmarshallFailure: true,
@@ -180,7 +182,7 @@ func TestCustomUnmarshaller(t *testing.T) {
 		{
 			name: "successfully override metric_group",
 			args: args{
-				componentParser: configparser.NewParser(),
+				componentParser: configparser.NewConfigMap(),
 				intoCfg: &Config{
 					CollectionInterval: 10 * time.Second,
 				},

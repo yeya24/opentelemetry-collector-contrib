@@ -27,7 +27,8 @@ import (
 	"go.opentelemetry.io/collector/config/configtest"
 	"go.opentelemetry.io/collector/config/configtls"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
-	prw "go.opentelemetry.io/collector/exporter/prometheusremotewriteexporter"
+
+	prw "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusremotewriteexporter"
 )
 
 // TestLoadConfig checks whether yaml configuration can be loaded correctly.
@@ -80,8 +81,8 @@ func TestLoadConfig(t *testing.T) {
 				WriteBufferSize: 512 * 1024,
 				Timeout:         5 * time.Second,
 				Headers: map[string]string{
-					"prometheus-remote-write-version": "0.1.0",
-					"x-scope-orgid":                   "234"},
+					"Prometheus-Remote-Write-Version": "0.1.0",
+					"X-Scope-OrgID":                   "234"},
 			},
 		},
 		AuthConfig: AuthConfig{

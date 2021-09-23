@@ -22,19 +22,19 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configcheck"
 	"go.opentelemetry.io/collector/config/confighttp"
-	"go.opentelemetry.io/collector/testutil"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/config/configtest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/testutil"
 )
 
 func TestFactory_CreateDefaultConfig(t *testing.T) {
 	factory := NewFactory()
 	cfg := factory.CreateDefaultConfig()
 	assert.NotNil(t, cfg, "failed to create default config")
-	assert.NoError(t, configcheck.ValidateConfig(cfg))
+	assert.NoError(t, configtest.CheckConfigStruct(cfg))
 	ocfg, ok := factory.CreateDefaultConfig().(*Config)
 	assert.True(t, ok)
 	assert.Equal(t, "", ocfg.HTTPClientSettings.Endpoint)
@@ -63,7 +63,8 @@ func TestFactory_CreateLogExporter(t *testing.T) {
 					Endpoint: "http://" + testutil.GetAvailableLocalAddress(t),
 				},
 				Labels: LabelsConfig{
-					Attributes: testValidAttributesWithMapping,
+					Attributes:         testValidAttributesWithMapping,
+					ResourceAttributes: testValidResourceWithMapping,
 				},
 			},
 			shouldError: false,
@@ -96,7 +97,7 @@ func TestFactory_CreateLogExporter(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			factory := NewFactory()
-			creationParams := component.ExporterCreateSettings{Logger: zap.NewNop()}
+			creationParams := componenttest.NewNopExporterCreateSettings()
 			exp, err := factory.CreateLogsExporter(context.Background(), creationParams, &tt.config)
 			if (err != nil) != tt.shouldError {
 				t.Errorf("CreateLogsExporter() error = %v, shouldError %v", err, tt.shouldError)

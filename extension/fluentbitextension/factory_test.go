@@ -20,10 +20,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configcheck"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/config/configtest"
 )
 
 func TestFactory_CreateDefaultConfig(t *testing.T) {
@@ -32,15 +31,15 @@ func TestFactory_CreateDefaultConfig(t *testing.T) {
 		ExtensionSettings: config.NewExtensionSettings(config.NewID(typeStr)),
 	}, cfg)
 
-	assert.NoError(t, configcheck.ValidateConfig(cfg))
-	ext, err := createExtension(context.Background(), component.ExtensionCreateSettings{Logger: zap.NewNop()}, cfg)
+	assert.NoError(t, configtest.CheckConfigStruct(cfg))
+	ext, err := createExtension(context.Background(), componenttest.NewNopExtensionCreateSettings(), cfg)
 	require.NoError(t, err)
 	require.NotNil(t, ext)
 }
 
 func TestFactory_CreateExtension(t *testing.T) {
 	cfg := createDefaultConfig().(*Config)
-	ext, err := createExtension(context.Background(), component.ExtensionCreateSettings{Logger: zap.NewNop()}, cfg)
+	ext, err := createExtension(context.Background(), componenttest.NewNopExtensionCreateSettings(), cfg)
 	require.NoError(t, err)
 	require.NotNil(t, ext)
 }

@@ -28,7 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/confighttp"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/model/pdata"
 )
 
 type senderTest struct {
@@ -161,13 +161,15 @@ func exampleMultitypeLogs() []pdata.LogRecord {
 
 	attVal = pdata.NewAttributeValueArray()
 	attArr := attVal.ArrayVal()
-	strVal := pdata.NewAttributeValueNull()
+	strVal := pdata.NewAttributeValueEmpty()
 	strVal.SetStringVal("lv2")
-	intVal := pdata.NewAttributeValueNull()
+	intVal := pdata.NewAttributeValueEmpty()
 	intVal.SetIntVal(13)
 
-	attArr.Append(strVal)
-	attArr.Append(intVal)
+	strTgt := attArr.AppendEmpty()
+	strVal.CopyTo(strTgt)
+	intTgt := attArr.AppendEmpty()
+	intVal.CopyTo(intTgt)
 
 	attVal.CopyTo(buffer[1].Body())
 	buffer[1].Attributes().InsertString("key1", "value1")

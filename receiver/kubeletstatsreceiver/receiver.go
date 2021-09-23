@@ -24,8 +24,8 @@ import (
 	"go.uber.org/zap"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kubeletstatsreceiver/kubelet"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/redisreceiver/interval"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/interval"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kubeletstatsreceiver/internal/kubelet"
 )
 
 var _ component.MetricsReceiver = (*receiver)(nil)
