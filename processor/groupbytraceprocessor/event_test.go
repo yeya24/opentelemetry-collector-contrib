@@ -1,46 +1,47 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package groupbytraceprocessor
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/stats/view"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/processor/processortest"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/groupbytraceprocessor/internal/metadata"
 )
 
 func TestEventCallback(t *testing.T) {
+	set := processortest.NewNopSettings(metadata.Type)
+	tel, _ := metadata.NewTelemetryBuilder(set.TelemetrySettings)
+
 	for _, tt := range []struct {
 		casename         string
 		typ              eventType
-		payload          interface{}
+		payload          any
 		registerCallback func(em *eventMachine, wg *sync.WaitGroup)
 	}{
 		{
 			casename: "onTraceReceived",
 			typ:      traceReceived,
-			payload:  tracesWithID{id: pdata.InvalidTraceID(), td: pdata.NewTraces()},
+			payload:  tracesWithID{id: pcommon.NewTraceIDEmpty(), td: ptrace.NewTraces()},
 			registerCallback: func(em *eventMachine, wg *sync.WaitGroup) {
-				em.onTraceReceived = func(received tracesWithID, worker *eventMachineWorker) error {
+				em.onTraceReceived = func(_ tracesWithID, _ *eventMachineWorker) error {
 					wg.Done()
 					return nil
 				}
@@ -49,11 +50,11 @@ func TestEventCallback(t *testing.T) {
 		{
 			casename: "onTraceExpired",
 			typ:      traceExpired,
-			payload:  pdata.NewTraceID([16]byte{1, 2, 3, 4}),
+			payload:  pcommon.TraceID([16]byte{1, 2, 3, 4}),
 			registerCallback: func(em *eventMachine, wg *sync.WaitGroup) {
-				em.onTraceExpired = func(expired pdata.TraceID, worker *eventMachineWorker) error {
+				em.onTraceExpired = func(expired pcommon.TraceID, _ *eventMachineWorker) error {
 					wg.Done()
-					assert.Equal(t, pdata.NewTraceID([16]byte{1, 2, 3, 4}), expired)
+					assert.Equal(t, pcommon.TraceID([16]byte{1, 2, 3, 4}), expired)
 					return nil
 				}
 			},
@@ -61,9 +62,9 @@ func TestEventCallback(t *testing.T) {
 		{
 			casename: "onTraceReleased",
 			typ:      traceReleased,
-			payload:  []pdata.ResourceSpans{},
+			payload:  []ptrace.ResourceSpans{},
 			registerCallback: func(em *eventMachine, wg *sync.WaitGroup) {
-				em.onTraceReleased = func(expired []pdata.ResourceSpans) error {
+				em.onTraceReleased = func(_ []ptrace.ResourceSpans) error {
 					wg.Done()
 					return nil
 				}
@@ -72,11 +73,11 @@ func TestEventCallback(t *testing.T) {
 		{
 			casename: "onTraceRemoved",
 			typ:      traceRemoved,
-			payload:  pdata.NewTraceID([16]byte{1, 2, 3, 4}),
+			payload:  pcommon.TraceID([16]byte{1, 2, 3, 4}),
 			registerCallback: func(em *eventMachine, wg *sync.WaitGroup) {
-				em.onTraceRemoved = func(expired pdata.TraceID) error {
+				em.onTraceRemoved = func(expired pcommon.TraceID) error {
 					wg.Done()
-					assert.Equal(t, pdata.NewTraceID([16]byte{1, 2, 3, 4}), expired)
+					assert.Equal(t, pcommon.TraceID([16]byte{1, 2, 3, 4}), expired)
 					return nil
 				}
 			},
@@ -88,7 +89,7 @@ func TestEventCallback(t *testing.T) {
 			require.NoError(t, err)
 
 			wg := &sync.WaitGroup{}
-			em := newEventMachine(logger, 50, 1, 1_000)
+			em := newEventMachine(logger, 50, 1, 1_000, tel)
 			tt.registerCallback(em, wg)
 
 			em.startInBackground()
@@ -108,6 +109,8 @@ func TestEventCallback(t *testing.T) {
 }
 
 func TestEventCallbackNotSet(t *testing.T) {
+	set := processortest.NewNopSettings(metadata.Type)
+	tel, _ := metadata.NewTelemetryBuilder(set.TelemetrySettings)
 	for _, tt := range []struct {
 		casename string
 		typ      eventType
@@ -135,8 +138,8 @@ func TestEventCallbackNotSet(t *testing.T) {
 			require.NoError(t, err)
 
 			wg := &sync.WaitGroup{}
-			em := newEventMachine(logger, 50, 1, 1_000)
-			em.onError = func(e event) {
+			em := newEventMachine(logger, 50, 1, 1_000, tel)
+			em.onError = func(_ event) {
 				wg.Done()
 			}
 			em.startInBackground()
@@ -155,6 +158,8 @@ func TestEventCallbackNotSet(t *testing.T) {
 }
 
 func TestEventInvalidPayload(t *testing.T) {
+	set := processortest.NewNopSettings(metadata.Type)
+	tel, _ := metadata.NewTelemetryBuilder(set.TelemetrySettings)
 	for _, tt := range []struct {
 		casename         string
 		typ              eventType
@@ -163,8 +168,8 @@ func TestEventInvalidPayload(t *testing.T) {
 		{
 			casename: "onTraceReceived",
 			typ:      traceReceived,
-			registerCallback: func(em *eventMachine, wg *sync.WaitGroup) {
-				em.onTraceReceived = func(received tracesWithID, worker *eventMachineWorker) error {
+			registerCallback: func(em *eventMachine, _ *sync.WaitGroup) {
+				em.onTraceReceived = func(_ tracesWithID, _ *eventMachineWorker) error {
 					return nil
 				}
 			},
@@ -172,8 +177,8 @@ func TestEventInvalidPayload(t *testing.T) {
 		{
 			casename: "onTraceExpired",
 			typ:      traceExpired,
-			registerCallback: func(em *eventMachine, wg *sync.WaitGroup) {
-				em.onTraceExpired = func(expired pdata.TraceID, worker *eventMachineWorker) error {
+			registerCallback: func(em *eventMachine, _ *sync.WaitGroup) {
+				em.onTraceExpired = func(_ pcommon.TraceID, _ *eventMachineWorker) error {
 					return nil
 				}
 			},
@@ -181,8 +186,8 @@ func TestEventInvalidPayload(t *testing.T) {
 		{
 			casename: "onTraceReleased",
 			typ:      traceReleased,
-			registerCallback: func(em *eventMachine, wg *sync.WaitGroup) {
-				em.onTraceReleased = func(released []pdata.ResourceSpans) error {
+			registerCallback: func(em *eventMachine, _ *sync.WaitGroup) {
+				em.onTraceReleased = func(_ []ptrace.ResourceSpans) error {
 					return nil
 				}
 			},
@@ -190,8 +195,8 @@ func TestEventInvalidPayload(t *testing.T) {
 		{
 			casename: "onTraceRemoved",
 			typ:      traceRemoved,
-			registerCallback: func(em *eventMachine, wg *sync.WaitGroup) {
-				em.onTraceRemoved = func(expired pdata.TraceID) error {
+			registerCallback: func(em *eventMachine, _ *sync.WaitGroup) {
+				em.onTraceRemoved = func(_ pcommon.TraceID) error {
 					return nil
 				}
 			},
@@ -203,8 +208,8 @@ func TestEventInvalidPayload(t *testing.T) {
 			require.NoError(t, err)
 
 			wg := &sync.WaitGroup{}
-			em := newEventMachine(logger, 50, 1, 1_000)
-			em.onError = func(e event) {
+			em := newEventMachine(logger, 50, 1, 1_000, tel)
+			em.onError = func(_ event) {
 				wg.Done()
 			}
 			tt.registerCallback(em, wg)
@@ -224,13 +229,15 @@ func TestEventInvalidPayload(t *testing.T) {
 }
 
 func TestEventUnknownType(t *testing.T) {
+	set := processortest.NewNopSettings(metadata.Type)
+	tel, _ := metadata.NewTelemetryBuilder(set.TelemetrySettings)
 	// prepare
 	logger, err := zap.NewDevelopment()
 	require.NoError(t, err)
 
 	wg := &sync.WaitGroup{}
-	em := newEventMachine(logger, 50, 1, 1_000)
-	em.onError = func(e event) {
+	em := newEventMachine(logger, 50, 1, 1_000, tel)
+	em.onError = func(_ event) {
 		wg.Done()
 	}
 	em.startInBackground()
@@ -247,6 +254,8 @@ func TestEventUnknownType(t *testing.T) {
 }
 
 func TestEventTracePerWorker(t *testing.T) {
+	set := processortest.NewNopSettings(metadata.Type)
+	tel, _ := metadata.NewTelemetryBuilder(set.TelemetrySettings)
 	for _, tt := range []struct {
 		casename  string
 		traceID   [16]byte
@@ -273,19 +282,19 @@ func TestEventTracePerWorker(t *testing.T) {
 		},
 	} {
 		t.Run(tt.casename, func(t *testing.T) {
-			em := newEventMachine(logger, 200, 100, 1_000)
+			em := newEventMachine(zap.NewNop(), 200, 100, 1_000, tel)
 
 			var wg sync.WaitGroup
 			var workerForTrace *eventMachineWorker
-			em.onTraceReceived = func(td tracesWithID, w *eventMachineWorker) error {
+			em.onTraceReceived = func(_ tracesWithID, w *eventMachineWorker) error {
 				workerForTrace = w
 				w.fire(event{
 					typ:     traceExpired,
-					payload: pdata.NewTraceID([16]byte{1}),
+					payload: pcommon.TraceID([16]byte{1}),
 				})
 				return nil
 			}
-			em.onTraceExpired = func(id pdata.TraceID, w *eventMachineWorker) error {
+			em.onTraceExpired = func(_ pcommon.TraceID, w *eventMachineWorker) error {
 				assert.Equal(t, workerForTrace, w)
 				wg.Done()
 				return nil
@@ -293,14 +302,11 @@ func TestEventTracePerWorker(t *testing.T) {
 			em.startInBackground()
 			defer em.shutdown()
 
-			td := pdata.NewTraces()
-			td.ResourceSpans().Resize(1)
-			td.ResourceSpans().At(0).InstrumentationLibrarySpans().Resize(1)
+			td := ptrace.NewTraces()
+			ils := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
 			if tt.traceID != [16]byte{} {
-				td.ResourceSpans().At(0).InstrumentationLibrarySpans().At(0).Spans().Resize(1)
-				span := pdata.NewSpan()
-				span.SetTraceID(pdata.NewTraceID(tt.traceID))
-				span.CopyTo(td.ResourceSpans().At(0).InstrumentationLibrarySpans().At(0).Spans().At(0))
+				span := ils.Spans().AppendEmpty()
+				span.SetTraceID(tt.traceID)
 			}
 
 			// test
@@ -336,14 +342,14 @@ func TestEventConsumeConsistency(t *testing.T) {
 		},
 	} {
 		t.Run(tt.casename, func(t *testing.T) {
-			realTraceID := workerIndexForTraceID(pdata.NewTraceID(tt.traceID), 100)
+			realTraceID := workerIndexForTraceID(pcommon.TraceID(tt.traceID), 100)
 			var wg sync.WaitGroup
 			for i := 0; i < 50; i++ {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
 					for j := 0; j < 30; j++ {
-						assert.Equal(t, realTraceID, workerIndexForTraceID(pdata.NewTraceID(tt.traceID), 100))
+						assert.Equal(t, realTraceID, workerIndexForTraceID(pcommon.TraceID(tt.traceID), 100))
 					}
 				}()
 			}
@@ -353,21 +359,24 @@ func TestEventConsumeConsistency(t *testing.T) {
 }
 
 func TestEventShutdown(t *testing.T) {
+	set := processortest.NewNopSettings(metadata.Type)
+	tel, _ := metadata.NewTelemetryBuilder(set.TelemetrySettings)
 	// prepare
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 
-	traceReceivedFired, traceExpiredFired := false, false
-	em := newEventMachine(logger, 50, 1, 1_000)
+	traceReceivedFired := &atomic.Int64{}
+	traceExpiredFired := &atomic.Int64{}
+	em := newEventMachine(zap.NewNop(), 50, 1, 1_000, tel)
 	em.onTraceReceived = func(tracesWithID, *eventMachineWorker) error {
-		traceReceivedFired = true
+		traceReceivedFired.Store(1)
 		return nil
 	}
-	em.onTraceExpired = func(pdata.TraceID, *eventMachineWorker) error {
-		traceExpiredFired = true
+	em.onTraceExpired = func(pcommon.TraceID, *eventMachineWorker) error {
+		traceExpiredFired.Store(1)
 		return nil
 	}
-	em.onTraceRemoved = func(pdata.TraceID) error {
+	em.onTraceRemoved = func(pcommon.TraceID) error {
 		wg.Wait()
 		return nil
 	}
@@ -376,15 +385,15 @@ func TestEventShutdown(t *testing.T) {
 	// test
 	em.workers[0].fire(event{
 		typ:     traceReceived,
-		payload: tracesWithID{id: pdata.InvalidTraceID(), td: pdata.NewTraces()},
+		payload: tracesWithID{id: pcommon.NewTraceIDEmpty(), td: ptrace.NewTraces()},
 	})
 	em.workers[0].fire(event{
 		typ:     traceRemoved,
-		payload: pdata.NewTraceID([16]byte{1, 2, 3, 4}),
+		payload: pcommon.TraceID([16]byte{1, 2, 3, 4}),
 	})
 	em.workers[0].fire(event{
 		typ:     traceRemoved,
-		payload: pdata.NewTraceID([16]byte{1, 2, 3, 4}),
+		payload: pcommon.TraceID([16]byte{1, 2, 3, 4}),
 	})
 
 	time.Sleep(10 * time.Millisecond)  // give it a bit of time to process the items
@@ -405,17 +414,17 @@ func TestEventShutdown(t *testing.T) {
 	// new events should *not* be processed
 	em.workers[0].fire(event{
 		typ:     traceExpired,
-		payload: pdata.NewTraceID([16]byte{1, 2, 3, 4}),
+		payload: pcommon.TraceID([16]byte{1, 2, 3, 4}),
 	})
 
 	// verify
-	assert.True(t, traceReceivedFired)
+	assert.Equal(t, int64(1), traceReceivedFired.Load())
 
 	// If the code is wrong, there's a chance that the test will still pass
 	// in case the event is processed after the assertion.
 	// for this reason, we add a small delay here
 	time.Sleep(10 * time.Millisecond)
-	assert.False(t, traceExpiredFired)
+	assert.Equal(t, int64(0), traceExpiredFired.Load())
 
 	// wait until the shutdown has returned
 	shutdownWg.Wait()
@@ -423,16 +432,14 @@ func TestEventShutdown(t *testing.T) {
 
 func TestPeriodicMetrics(t *testing.T) {
 	// prepare
-	views := MetricViews()
+	s := setupTestTelemetry()
+	t.Cleanup(func() {
+		require.NoError(t, s.Shutdown(context.Background()))
+	})
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(s.newTelemetrySettings())
+	require.NoError(t, err)
 
-	// ensure that we are starting with a clean state
-	view.Unregister(views...)
-	view.Register(views...)
-
-	// try to be nice with the next consumer (test)
-	defer view.Unregister(views...)
-
-	em := newEventMachine(logger, 50, 1, 1_000)
+	em := newEventMachine(zap.NewNop(), 50, 1, 1_000, telemetryBuilder)
 	em.metricsCollectionInterval = time.Millisecond
 
 	wg := sync.WaitGroup{}
@@ -453,7 +460,7 @@ func TestPeriodicMetrics(t *testing.T) {
 	}()
 
 	// sanity check
-	assertGaugeNotCreated(t, mNumEventsInQueue)
+	assertGaugeNotCreated(t, "otelcol_processor_groupbytrace_num_events_in_queue", s)
 
 	// test
 	em.workers[0].fire(event{typ: traceReceived})
@@ -461,14 +468,16 @@ func TestPeriodicMetrics(t *testing.T) {
 	go em.periodicMetrics()
 
 	// ensure our gauge is showing 1 item in the queue
-	time.Sleep(10 * time.Millisecond) // wait enough time for the gauge to be updated
-	assertGauge(t, 1, mNumEventsInQueue)
+	assert.Eventually(t, func() bool {
+		return getGaugeValue(t, "otelcol_processor_groupbytrace_num_events_in_queue", s) == 1
+	}, 1*time.Second, 10*time.Millisecond)
 
 	wg.Done() // release all events
-	time.Sleep(5 * time.Millisecond)
 
 	// ensure our gauge is now showing no items in the queue
-	assertGauge(t, 0, mNumEventsInQueue)
+	assert.Eventually(t, func() bool {
+		return getGaugeValue(t, "otelcol_processor_groupbytrace_num_events_in_queue", s) == 0
+	}, 1*time.Second, 10*time.Millisecond)
 
 	// signal and wait for the recursive call to finish
 	em.shutdownLock.Lock()
@@ -478,8 +487,10 @@ func TestPeriodicMetrics(t *testing.T) {
 }
 
 func TestForceShutdown(t *testing.T) {
+	set := processortest.NewNopSettings(metadata.Type)
+	tel, _ := metadata.NewTelemetryBuilder(set.TelemetrySettings)
 	// prepare
-	em := newEventMachine(logger, 50, 1, 1_000)
+	em := newEventMachine(zap.NewNop(), 50, 1, 1_000, tel)
 	em.shutdownTimeout = 20 * time.Millisecond
 
 	// test
@@ -490,40 +501,86 @@ func TestForceShutdown(t *testing.T) {
 	duration := time.Since(start)
 
 	// verify
-	assert.True(t, duration > 20*time.Millisecond)
+	assert.Greater(t, duration, 20*time.Millisecond)
 
 	// wait for shutdown goroutine to end
 	time.Sleep(100 * time.Millisecond)
 }
 
-func TestDoWithTimeout(t *testing.T) {
+func TestDoWithTimeout_NoTimeout(t *testing.T) {
+	// prepare
+	wantErr := errors.New("my error")
+	// test
+	succeed, err := doWithTimeout(20*time.Millisecond, func() error {
+		return wantErr
+	})
+	assert.True(t, succeed)
+	assert.Equal(t, wantErr, err)
+}
+
+func TestDoWithTimeout_TimeoutTrigger(t *testing.T) {
 	// prepare
 	start := time.Now()
 
-	done := make(chan struct{})
-
 	// test
-	doWithTimeout(5*time.Millisecond, func() error {
-		<-done
+	succeed, err := doWithTimeout(20*time.Millisecond, func() error {
+		time.Sleep(1 * time.Second)
 		return nil
 	})
-	close(done)
+	assert.False(t, succeed)
+	assert.NoError(t, err)
 
 	// verify
-	assert.WithinDuration(t, start, time.Now(), 20*time.Millisecond)
+	assert.WithinDuration(t, start, time.Now(), 100*time.Millisecond)
 }
 
-func assertGauge(t *testing.T, expected int, gauge *stats.Int64Measure) {
-	viewData, err := view.RetrieveData("processor/groupbytrace/" + gauge.Name())
-	require.NoError(t, err)
-	require.Len(t, viewData, 1) // we expect exactly one data point, the last value
-
-	sum := viewData[0].Data.(*view.LastValueData)
-	assert.EqualValues(t, expected, sum.Value)
+func getGaugeValue(t *testing.T, name string, tt testTelemetry) int64 {
+	var md metricdata.ResourceMetrics
+	require.NoError(t, tt.reader.Collect(context.Background(), &md))
+	m := tt.getMetric(name, md).Data
+	g := m.(metricdata.Gauge[int64])
+	assert.Len(t, g.DataPoints, 1, "expected exactly one data point")
+	return g.DataPoints[0].Value
 }
 
-func assertGaugeNotCreated(t *testing.T, gauge *stats.Int64Measure) {
-	viewData, err := view.RetrieveData("processor/groupbytrace/" + gauge.Name())
-	require.NoError(t, err)
-	assert.Len(t, viewData, 0, "gauge exists already but shouldn't")
+func assertGaugeNotCreated(t *testing.T, name string, tt testTelemetry) {
+	var md metricdata.ResourceMetrics
+	require.NoError(t, tt.reader.Collect(context.Background(), &md))
+	got := tt.getMetric(name, md)
+	assert.Equal(t, metricdata.Metrics{}, got, "gauge exists already but shouldn't")
+}
+
+type testTelemetry struct {
+	reader        *sdkmetric.ManualReader
+	meterProvider *sdkmetric.MeterProvider
+}
+
+func setupTestTelemetry() testTelemetry {
+	reader := sdkmetric.NewManualReader()
+	return testTelemetry{
+		reader:        reader,
+		meterProvider: sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)),
+	}
+}
+
+func (tt *testTelemetry) newTelemetrySettings() component.TelemetrySettings {
+	set := componenttest.NewNopTelemetrySettings()
+	set.MeterProvider = tt.meterProvider
+	return set
+}
+
+func (tt *testTelemetry) getMetric(name string, got metricdata.ResourceMetrics) metricdata.Metrics {
+	for _, sm := range got.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == name {
+				return m
+			}
+		}
+	}
+
+	return metricdata.Metrics{}
+}
+
+func (tt *testTelemetry) Shutdown(ctx context.Context) error {
+	return tt.meterProvider.Shutdown(ctx)
 }
