@@ -1,16 +1,5 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package ecsobserver
 
@@ -45,7 +34,7 @@ func TestTaskDefinitionMatcher(t *testing.T) {
 		require.Error(t, cfg.validate())
 	})
 
-	emptyTask := &Task{
+	emptyTask := &taskAnnotated{
 		Task: &ecs.Task{TaskDefinitionArn: aws.String("arn:that:never:matches")},
 		Definition: &ecs.TaskDefinition{
 			TaskDefinitionArn: aws.String("arn:that:never:matches"),
@@ -56,8 +45,8 @@ func TestTaskDefinitionMatcher(t *testing.T) {
 			},
 		},
 	}
-	genTasks := func() []*Task {
-		return []*Task{
+	genTasks := func() []*taskAnnotated {
+		return []*taskAnnotated{
 			{
 				Task: &ecs.Task{
 					TaskDefinitionArn: aws.String("arn:alike:nginx-latest"),
@@ -99,15 +88,15 @@ func TestTaskDefinitionMatcher(t *testing.T) {
 			},
 		}
 		res := newMatcherAndMatch(t, &cfg, genTasks())
-		assert.Equal(t, &MatchResult{
+		assert.Equal(t, &matchResult{
 			Tasks: []int{0},
-			Containers: []MatchedContainer{
+			Containers: []matchedContainer{
 				{
 					TaskIndex:      0,
 					ContainerIndex: 0,
-					Targets: []MatchedTarget{
+					Targets: []matchedTarget{
 						{
-							MatcherType: MatcherTypeTaskDefinition,
+							MatcherType: matcherTypeTaskDefinition,
 							Port:        2112,
 							Job:         "CONFIG_PROM_JOB",
 						},
@@ -132,15 +121,15 @@ func TestTaskDefinitionMatcher(t *testing.T) {
 			},
 		}
 		res := newMatcherAndMatch(t, &cfg, genTasks())
-		assert.Equal(t, &MatchResult{
+		assert.Equal(t, &matchResult{
 			Tasks: []int{0},
-			Containers: []MatchedContainer{
+			Containers: []matchedContainer{
 				{
 					TaskIndex:      0,
 					ContainerIndex: 1,
-					Targets: []MatchedTarget{
+					Targets: []matchedTarget{
 						{
-							MatcherType: MatcherTypeTaskDefinition,
+							MatcherType: matcherTypeTaskDefinition,
 							Port:        2114,
 							Job:         "CONFIG_PROM_JOB",
 						},
