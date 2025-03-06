@@ -1,16 +1,5 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package ecsobserver
 
@@ -26,7 +15,7 @@ import (
 
 func TestTask_Tags(t *testing.T) {
 	t.Run("ec2", func(t *testing.T) {
-		task := Task{}
+		task := taskAnnotated{}
 		assert.Equal(t, map[string]string(nil), task.EC2Tags())
 		task.EC2 = &ec2.Instance{
 			Tags: []*ec2.Tag{
@@ -40,7 +29,7 @@ func TestTask_Tags(t *testing.T) {
 	})
 
 	t.Run("task", func(t *testing.T) {
-		task := Task{Task: &ecs.Task{}}
+		task := taskAnnotated{Task: &ecs.Task{}}
 		assert.Equal(t, map[string]string(nil), task.TaskTags())
 		task.Task.Tags = []*ecs.Tag{
 			{
@@ -52,7 +41,7 @@ func TestTask_Tags(t *testing.T) {
 	})
 
 	t.Run("container", func(t *testing.T) {
-		task := Task{Definition: &ecs.TaskDefinition{ContainerDefinitions: []*ecs.ContainerDefinition{{}}}}
+		task := taskAnnotated{Definition: &ecs.TaskDefinition{ContainerDefinitions: []*ecs.ContainerDefinition{{}}}}
 		assert.Equal(t, map[string]string(nil), task.ContainerLabels(0))
 		task.Definition.ContainerDefinitions[0].DockerLabels = map[string]*string{
 			"k": aws.String("v"),
@@ -63,7 +52,7 @@ func TestTask_Tags(t *testing.T) {
 
 func TestTask_PrivateIP(t *testing.T) {
 	t.Run("awsvpc", func(t *testing.T) {
-		task := Task{
+		task := taskAnnotated{
 			Task: &ecs.Task{
 				TaskArn:           aws.String("arn:task:t2"),
 				TaskDefinitionArn: aws.String("t2"),
@@ -87,7 +76,7 @@ func TestTask_PrivateIP(t *testing.T) {
 	})
 
 	t.Run("not found", func(t *testing.T) {
-		task := Task{
+		task := taskAnnotated{
 			Task:       &ecs.Task{TaskArn: aws.String("arn:task:1")},
 			Definition: &ecs.TaskDefinition{},
 		}
@@ -96,11 +85,12 @@ func TestTask_PrivateIP(t *testing.T) {
 			task.Definition.NetworkMode = aws.String(mode)
 			_, err := task.PrivateIP()
 			assert.Error(t, err)
-			assert.IsType(t, &ErrPrivateIPNotFound{}, err)
-			assert.Equal(t, mode, err.(*ErrPrivateIPNotFound).NetworkMode)
+			errPINF := &errPrivateIPNotFound{}
+			require.ErrorAs(t, err, &errPINF)
+			assert.Equal(t, mode, errPINF.NetworkMode)
 			// doing contains on error message is not good, but this line increase test coverage from 93% to 98%
 			// not sure how the average coverage is calculated ...
-			assert.Contains(t, err.Error(), mode)
+			assert.ErrorContains(t, err, mode)
 		}
 	})
 }
@@ -122,27 +112,27 @@ func TestTask_MappedPort(t *testing.T) {
 	}
 	// Network mode is optional for ecs and it default to ec2 bridge
 	t.Run("empty is ec2 bridge", func(t *testing.T) {
-		task := Task{
+		task := taskAnnotated{
 			Task:       ec2BridgeTask,
 			Definition: &ecs.TaskDefinition{NetworkMode: nil},
 			EC2:        &ec2.Instance{PrivateIpAddress: aws.String("172.168.1.1")},
 		}
 		ip, err := task.PrivateIP()
-		require.Nil(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, "172.168.1.1", ip)
 		p, err := task.MappedPort(&ecs.ContainerDefinition{Name: aws.String("c1")}, 2112)
-		require.Nil(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, int64(2345), p)
 	})
 
 	t.Run("ec2 bridge", func(t *testing.T) {
-		task := Task{
+		task := taskAnnotated{
 			Task:       ec2BridgeTask,
 			Definition: &ecs.TaskDefinition{NetworkMode: aws.String(ecs.NetworkModeBridge)},
 			EC2:        &ec2.Instance{PrivateIpAddress: aws.String("172.168.1.1")},
 		}
 		p, err := task.MappedPort(&ecs.ContainerDefinition{Name: aws.String("c1")}, 2112)
-		require.Nil(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, int64(2345), p)
 	})
 
@@ -161,29 +151,29 @@ func TestTask_MappedPort(t *testing.T) {
 		},
 	}
 	t.Run("awsvpc", func(t *testing.T) {
-		task := Task{
+		task := taskAnnotated{
 			Task:       &ecs.Task{TaskArn: aws.String("arn:task:1")},
 			Definition: vpcTaskDef,
 		}
 		p, err := task.MappedPort(vpcTaskDef.ContainerDefinitions[0], 2112)
-		require.Nil(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, int64(2345), p)
 	})
 
 	t.Run("host", func(t *testing.T) {
 		def := vpcTaskDef
 		def.NetworkMode = aws.String(ecs.NetworkModeHost)
-		task := Task{
+		task := taskAnnotated{
 			Task:       &ecs.Task{TaskArn: aws.String("arn:task:1")},
 			Definition: def,
 		}
 		p, err := task.MappedPort(def.ContainerDefinitions[0], 2112)
-		require.Nil(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, int64(2345), p)
 	})
 
 	t.Run("not found", func(t *testing.T) {
-		task := Task{
+		task := taskAnnotated{
 			Task:       &ecs.Task{TaskArn: aws.String("arn:task:1")},
 			Definition: &ecs.TaskDefinition{},
 		}
@@ -192,21 +182,23 @@ func TestTask_MappedPort(t *testing.T) {
 			task.Definition.NetworkMode = aws.String(mode)
 			_, err := task.MappedPort(&ecs.ContainerDefinition{Name: aws.String("c11")}, 1234)
 			assert.Error(t, err)
-			assert.Equal(t, mode, err.(*ErrMappedPortNotFound).NetworkMode)
-			assert.Contains(t, err.Error(), mode) // for coverage
+			errMPNF := &errMappedPortNotFound{}
+			require.ErrorAs(t, err, &errMPNF)
+			assert.Equal(t, mode, errMPNF.NetworkMode)
+			assert.ErrorContains(t, err, mode) // for coverage
 		}
 	})
 }
 
 func TestTask_AddMatchedContainer(t *testing.T) {
 	t.Run("different container", func(t *testing.T) {
-		task := Task{
-			Matched: []MatchedContainer{
+		task := taskAnnotated{
+			Matched: []matchedContainer{
 				{
 					ContainerIndex: 0,
-					Targets: []MatchedTarget{
+					Targets: []matchedTarget{
 						{
-							MatcherType: MatcherTypeService,
+							MatcherType: matcherTypeService,
 							Port:        1,
 						},
 					},
@@ -214,30 +206,30 @@ func TestTask_AddMatchedContainer(t *testing.T) {
 			},
 		}
 
-		task.AddMatchedContainer(MatchedContainer{
+		task.AddMatchedContainer(matchedContainer{
 			ContainerIndex: 1,
-			Targets: []MatchedTarget{
+			Targets: []matchedTarget{
 				{
-					MatcherType: MatcherTypeDockerLabel,
+					MatcherType: matcherTypeDockerLabel,
 					Port:        2,
 				},
 			},
 		})
-		assert.Equal(t, []MatchedContainer{
+		assert.Equal(t, []matchedContainer{
 			{
 				ContainerIndex: 0,
-				Targets: []MatchedTarget{
+				Targets: []matchedTarget{
 					{
-						MatcherType: MatcherTypeService,
+						MatcherType: matcherTypeService,
 						Port:        1,
 					},
 				},
 			},
 			{
 				ContainerIndex: 1,
-				Targets: []MatchedTarget{
+				Targets: []matchedTarget{
 					{
-						MatcherType: MatcherTypeDockerLabel,
+						MatcherType: matcherTypeDockerLabel,
 						Port:        2,
 					},
 				},
@@ -245,40 +237,40 @@ func TestTask_AddMatchedContainer(t *testing.T) {
 		}, task.Matched)
 	})
 
-	t.Run("same container different metris path", func(t *testing.T) {
-		task := Task{
-			Matched: []MatchedContainer{
+	t.Run("same container different metrics path", func(t *testing.T) {
+		task := taskAnnotated{
+			Matched: []matchedContainer{
 				{
 					ContainerIndex: 0,
-					Targets: []MatchedTarget{
+					Targets: []matchedTarget{
 						{
-							MatcherType: MatcherTypeService,
+							MatcherType: matcherTypeService,
 							Port:        1,
 						},
 					},
 				},
 			},
 		}
-		task.AddMatchedContainer(MatchedContainer{
+		task.AddMatchedContainer(matchedContainer{
 			ContainerIndex: 0,
-			Targets: []MatchedTarget{
+			Targets: []matchedTarget{
 				{
-					MatcherType: MatcherTypeTaskDefinition,
+					MatcherType: matcherTypeTaskDefinition,
 					Port:        1,
 					MetricsPath: "/metrics2",
 				},
 			},
 		})
-		assert.Equal(t, []MatchedContainer{
+		assert.Equal(t, []matchedContainer{
 			{
 				ContainerIndex: 0,
-				Targets: []MatchedTarget{
+				Targets: []matchedTarget{
 					{
-						MatcherType: MatcherTypeService,
+						MatcherType: matcherTypeService,
 						Port:        1,
 					},
 					{
-						MatcherType: MatcherTypeTaskDefinition,
+						MatcherType: matcherTypeTaskDefinition,
 						Port:        1,
 						MetricsPath: "/metrics2",
 					},
@@ -288,35 +280,35 @@ func TestTask_AddMatchedContainer(t *testing.T) {
 	})
 
 	t.Run("same container same metrics path", func(t *testing.T) {
-		task := Task{
-			Matched: []MatchedContainer{
+		task := taskAnnotated{
+			Matched: []matchedContainer{
 				{
 					ContainerIndex: 0,
-					Targets: []MatchedTarget{
+					Targets: []matchedTarget{
 						{
-							MatcherType: MatcherTypeService,
+							MatcherType: matcherTypeService,
 							Port:        1,
 						},
 					},
 				},
 			},
 		}
-		task.AddMatchedContainer(MatchedContainer{
+		task.AddMatchedContainer(matchedContainer{
 			ContainerIndex: 0,
-			Targets: []MatchedTarget{
+			Targets: []matchedTarget{
 				{
-					MatcherType: MatcherTypeTaskDefinition,
+					MatcherType: matcherTypeTaskDefinition,
 					Port:        1,
 					MetricsPath: "",
 				},
 			},
 		})
-		assert.Equal(t, []MatchedContainer{
+		assert.Equal(t, []matchedContainer{
 			{
 				ContainerIndex: 0,
-				Targets: []MatchedTarget{
+				Targets: []matchedTarget{
 					{
-						MatcherType: MatcherTypeService,
+						MatcherType: matcherTypeService,
 						Port:        1,
 					},
 				},

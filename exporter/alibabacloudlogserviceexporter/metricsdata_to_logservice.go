@@ -1,18 +1,7 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package alibabacloudlogserviceexporter
+package alibabacloudlogserviceexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/alibabacloudlogserviceexporter"
 
 import (
 	"sort"
@@ -21,8 +10,8 @@ import (
 
 	sls "github.com/aliyun/aliyun-log-go-sdk"
 	"github.com/gogo/protobuf/proto"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	tracetranslator "go.opentelemetry.io/collector/translator/trace"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
 )
 
@@ -108,12 +97,11 @@ func formatMetricName(name string) string {
 			b == '_' ||
 			b == ':' {
 			continue
-		} else {
-			if newName == nil {
-				newName = []byte(name)
-			}
-			newName[i] = '_'
 		}
+		if newName == nil {
+			newName = []byte(name)
+		}
+		newName[i] = '_'
 	}
 	if newName == nil {
 		return name
@@ -125,7 +113,8 @@ func newMetricLogFromRaw(
 	name string,
 	labels KeyValues,
 	nsec int64,
-	value float64) *sls.Log {
+	value float64,
+) *sls.Log {
 	labels.Sort()
 	return &sls.Log{
 		Time: proto.Uint32(uint32(nsec / 1e9)),
@@ -150,113 +139,52 @@ func newMetricLogFromRaw(
 	}
 }
 
-func min(l, r int) int {
-	if l < r {
-		return l
-	}
-	return r
-}
-
-func resourceToMetricLabels(labels *KeyValues, resource pdata.Resource) {
+func resourceToMetricLabels(labels *KeyValues, resource pcommon.Resource) {
 	attrs := resource.Attributes()
-	attrs.Range(func(k string, v pdata.AttributeValue) bool {
-		labels.keyValues = append(labels.keyValues, KeyValue{
-			Key:   k,
-			Value: tracetranslator.AttributeValueToString(v),
-		})
+	attrs.Range(func(k string, v pcommon.Value) bool {
+		labels.Append(k, v.AsString())
 		return true
 	})
 }
 
-func intMetricsToLogs(name string, data pdata.IntDataPointSlice, defaultLabels KeyValues) (logs []*sls.Log) {
+func numberMetricsToLogs(name string, data pmetric.NumberDataPointSlice, defaultLabels KeyValues) (logs []*sls.Log) {
 	for i := 0; i < data.Len(); i++ {
 		dataPoint := data.At(i)
-		labelsMap := dataPoint.LabelsMap()
+		attributeMap := dataPoint.Attributes()
 		labels := defaultLabels.Clone()
-		labelsMap.Range(func(k string, v string) bool {
-			labels.Append(k, v)
+		attributeMap.Range(func(k string, v pcommon.Value) bool {
+			labels.Append(k, v.AsString())
 			return true
 		})
-		logs = append(logs, newMetricLogFromRaw(name,
-			labels,
-			int64(dataPoint.Timestamp()),
-			float64(dataPoint.Value())))
-	}
-	return logs
-}
-
-func doubleMetricsToLogs(name string, data pdata.DoubleDataPointSlice, defaultLabels KeyValues) (logs []*sls.Log) {
-	for i := 0; i < data.Len(); i++ {
-		dataPoint := data.At(i)
-		labelsMap := dataPoint.LabelsMap()
-		labels := defaultLabels.Clone()
-		labelsMap.Range(func(k string, v string) bool {
-			labels.Append(k, v)
-			return true
-		})
-		logs = append(logs, newMetricLogFromRaw(name,
-			labels,
-			int64(dataPoint.Timestamp()),
-			dataPoint.Value()))
-	}
-	return logs
-}
-
-func intHistogramMetricsToLogs(name string, data pdata.IntHistogramDataPointSlice, defaultLabels KeyValues) (logs []*sls.Log) {
-	for i := 0; i < data.Len(); i++ {
-		dataPoint := data.At(i)
-		labelsMap := dataPoint.LabelsMap()
-		labels := defaultLabels.Clone()
-		labelsMap.Range(func(k string, v string) bool {
-			labels.Append(k, v)
-			return true
-		})
-		logs = append(logs, newMetricLogFromRaw(name+"_sum",
-			labels,
-			int64(dataPoint.Timestamp()),
-			float64(dataPoint.Sum())))
-		logs = append(logs, newMetricLogFromRaw(name+"_count",
-			labels,
-			int64(dataPoint.Timestamp()),
-			float64(dataPoint.Count())))
-
-		bounds := dataPoint.ExplicitBounds()
-		boundsStr := make([]string, len(bounds)+1)
-		for i := 0; i < len(bounds); i++ {
-			boundsStr[i] = strconv.FormatFloat(bounds[i], 'g', -1, 64)
-		}
-		boundsStr[len(boundsStr)-1] = infinityBoundValue
-
-		bucketCount := min(len(boundsStr), len(dataPoint.BucketCounts()))
-
-		bucketLabels := labels.Clone()
-		bucketLabels.Append(bucketLabelKey, "")
-		bucketLabels.Sort()
-		for i := 0; i < bucketCount; i++ {
-			bucket := dataPoint.BucketCounts()[i]
-			bucketLabels.Replace(bucketLabelKey, boundsStr[i])
-
-			logs = append(
-				logs,
-				newMetricLogFromRaw(
-					name+"_bucket",
-					bucketLabels,
+		switch dataPoint.ValueType() {
+		case pmetric.NumberDataPointValueTypeInt:
+			logs = append(logs,
+				newMetricLogFromRaw(name,
+					labels,
 					int64(dataPoint.Timestamp()),
-					float64(bucket),
-				))
+					float64(dataPoint.IntValue()),
+				),
+			)
+		case pmetric.NumberDataPointValueTypeDouble:
+			logs = append(logs,
+				newMetricLogFromRaw(name,
+					labels,
+					int64(dataPoint.Timestamp()),
+					dataPoint.DoubleValue(),
+				),
+			)
 		}
-
 	}
 	return logs
 }
 
-func doubleHistogramMetricsToLogs(name string, data pdata.HistogramDataPointSlice, defaultLabels KeyValues) (logs []*sls.Log) {
+func doubleHistogramMetricsToLogs(name string, data pmetric.HistogramDataPointSlice, defaultLabels KeyValues) (logs []*sls.Log) {
 	for i := 0; i < data.Len(); i++ {
 		dataPoint := data.At(i)
-		labelsMap := dataPoint.LabelsMap()
+		attributeMap := dataPoint.Attributes()
 		labels := defaultLabels.Clone()
-		labelsMap.Range(func(k string, v string) bool {
-			labels.Append(k, v)
+		attributeMap.Range(func(k string, v pcommon.Value) bool {
+			labels.Append(k, v.AsString())
 			return true
 		})
 		logs = append(logs, newMetricLogFromRaw(name+"_sum",
@@ -269,19 +197,19 @@ func doubleHistogramMetricsToLogs(name string, data pdata.HistogramDataPointSlic
 			float64(dataPoint.Count())))
 
 		bounds := dataPoint.ExplicitBounds()
-		boundsStr := make([]string, len(bounds)+1)
-		for i := 0; i < len(bounds); i++ {
-			boundsStr[i] = strconv.FormatFloat(bounds[i], 'g', -1, 64)
+		boundsStr := make([]string, bounds.Len()+1)
+		for i := 0; i < bounds.Len(); i++ {
+			boundsStr[i] = strconv.FormatFloat(bounds.At(i), 'g', -1, 64)
 		}
 		boundsStr[len(boundsStr)-1] = infinityBoundValue
 
-		bucketCount := min(len(boundsStr), len(dataPoint.BucketCounts()))
+		bucketCount := min(len(boundsStr), dataPoint.BucketCounts().Len())
 
 		bucketLabels := labels.Clone()
 		bucketLabels.Append(bucketLabelKey, "")
 		bucketLabels.Sort()
 		for i := 0; i < bucketCount; i++ {
-			bucket := dataPoint.BucketCounts()[i]
+			bucket := dataPoint.BucketCounts().At(i)
 			bucketLabels.Replace(bucketLabelKey, boundsStr[i])
 
 			logs = append(
@@ -293,18 +221,17 @@ func doubleHistogramMetricsToLogs(name string, data pdata.HistogramDataPointSlic
 					float64(bucket),
 				))
 		}
-
 	}
 	return logs
 }
 
-func doubleSummaryMetricsToLogs(name string, data pdata.SummaryDataPointSlice, defaultLabels KeyValues) (logs []*sls.Log) {
+func doubleSummaryMetricsToLogs(name string, data pmetric.SummaryDataPointSlice, defaultLabels KeyValues) (logs []*sls.Log) {
 	for i := 0; i < data.Len(); i++ {
 		dataPoint := data.At(i)
-		labelsMap := dataPoint.LabelsMap()
+		attributeMap := dataPoint.Attributes()
 		labels := defaultLabels.Clone()
-		labelsMap.Range(func(k string, v string) bool {
-			labels.Append(k, v)
+		attributeMap.Range(func(k string, v pcommon.Value) bool {
+			labels.Append(k, v.AsString())
 			return true
 		})
 		logs = append(logs, newMetricLogFromRaw(name+"_sum",
@@ -334,23 +261,18 @@ func doubleSummaryMetricsToLogs(name string, data pdata.SummaryDataPointSlice, d
 	return logs
 }
 
-func metricDataToLogServiceData(md pdata.Metric, defaultLabels KeyValues) (logs []*sls.Log) {
-	switch md.DataType() {
-	case pdata.MetricDataTypeNone:
+func metricDataToLogServiceData(md pmetric.Metric, defaultLabels KeyValues) (logs []*sls.Log) {
+	//exhaustive:enforce
+	switch md.Type() {
+	case pmetric.MetricTypeEmpty, pmetric.MetricTypeExponentialHistogram:
 		break
-	case pdata.MetricDataTypeIntGauge:
-		return intMetricsToLogs(md.Name(), md.IntGauge().DataPoints(), defaultLabels)
-	case pdata.MetricDataTypeDoubleGauge:
-		return doubleMetricsToLogs(md.Name(), md.DoubleGauge().DataPoints(), defaultLabels)
-	case pdata.MetricDataTypeIntSum:
-		return intMetricsToLogs(md.Name(), md.IntSum().DataPoints(), defaultLabels)
-	case pdata.MetricDataTypeDoubleSum:
-		return doubleMetricsToLogs(md.Name(), md.DoubleSum().DataPoints(), defaultLabels)
-	case pdata.MetricDataTypeIntHistogram:
-		return intHistogramMetricsToLogs(md.Name(), md.IntHistogram().DataPoints(), defaultLabels)
-	case pdata.MetricDataTypeHistogram:
+	case pmetric.MetricTypeGauge:
+		return numberMetricsToLogs(md.Name(), md.Gauge().DataPoints(), defaultLabels)
+	case pmetric.MetricTypeSum:
+		return numberMetricsToLogs(md.Name(), md.Sum().DataPoints(), defaultLabels)
+	case pmetric.MetricTypeHistogram:
 		return doubleHistogramMetricsToLogs(md.Name(), md.Histogram().DataPoints(), defaultLabels)
-	case pdata.MetricDataTypeSummary:
+	case pmetric.MetricTypeSummary:
 		return doubleSummaryMetricsToLogs(md.Name(), md.Summary().DataPoints(), defaultLabels)
 	}
 	return logs
@@ -358,18 +280,17 @@ func metricDataToLogServiceData(md pdata.Metric, defaultLabels KeyValues) (logs 
 
 func metricsDataToLogServiceData(
 	_ *zap.Logger,
-	md pdata.Metrics,
+	md pmetric.Metrics,
 ) (logs []*sls.Log) {
-
 	resMetrics := md.ResourceMetrics()
 	for i := 0; i < resMetrics.Len(); i++ {
 		resMetricSlice := resMetrics.At(i)
 		var defaultLabels KeyValues
 		resourceToMetricLabels(&defaultLabels, resMetricSlice.Resource())
-		insMetricSlice := resMetricSlice.InstrumentationLibraryMetrics()
+		insMetricSlice := resMetricSlice.ScopeMetrics()
 		for j := 0; j < insMetricSlice.Len(); j++ {
 			insMetrics := insMetricSlice.At(j)
-			// ignore insMetrics.InstrumentationLibrary()
+			// ignore insMetrics.Scope()
 			metricSlice := insMetrics.Metrics()
 			for k := 0; k < metricSlice.Len(); k++ {
 				oneMetric := metricSlice.At(k)

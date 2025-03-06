@@ -1,18 +1,7 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package simpleprometheusreceiver
+package simpleprometheusreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/simpleprometheusreceiver"
 
 import (
 	"context"
@@ -24,20 +13,24 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configtls"
 	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/receiver/prometheusreceiver"
+	"go.opentelemetry.io/collector/receiver"
 	"k8s.io/client-go/rest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/prometheusreceiver"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/simpleprometheusreceiver/internal/metadata"
 )
 
 type prometheusReceiverWrapper struct {
-	params            component.ReceiverCreateSettings
-	config            *Config
-	consumer          consumer.Metrics
-	prometheusRecever component.MetricsReceiver
+	params             receiver.Settings
+	config             *Config
+	consumer           consumer.Metrics
+	prometheusReceiver receiver.Metrics
 }
 
-// new returns a prometheusReceiverWrapper
-func new(params component.ReceiverCreateSettings, cfg *Config, consumer consumer.Metrics) *prometheusReceiverWrapper {
+// newPrometheusReceiverWrapper returns a prometheusReceiverWrapper
+func newPrometheusReceiverWrapper(params receiver.Settings, cfg *Config, consumer consumer.Metrics) *prometheusReceiverWrapper {
 	return &prometheusReceiverWrapper{params: params, config: cfg, consumer: consumer}
 }
 
@@ -45,18 +38,40 @@ func new(params component.ReceiverCreateSettings, cfg *Config, consumer consumer
 func (prw *prometheusReceiverWrapper) Start(ctx context.Context, host component.Host) error {
 	pFactory := prometheusreceiver.NewFactory()
 
-	pConfig, err := getPrometheusConfig(prw.config)
+	pConfig, err := getPrometheusConfigWrapper(prw.config, prw.params)
 	if err != nil {
-		return fmt.Errorf("failed to create prometheus receiver config: %v", err)
+		return fmt.Errorf("failed to create prometheus receiver config: %w", err)
 	}
 
-	pr, err := pFactory.CreateMetricsReceiver(ctx, prw.params, pConfig, prw.consumer)
+	params := receiver.Settings{
+		ID:                component.NewIDWithName(pFactory.Type(), prw.params.ID.String()),
+		TelemetrySettings: prw.params.TelemetrySettings,
+		BuildInfo:         prw.params.BuildInfo,
+	}
+	pr, err := pFactory.CreateMetrics(ctx, params, pConfig, prw.consumer)
 	if err != nil {
-		return fmt.Errorf("failed to create prometheus receiver: %v", err)
+		return fmt.Errorf("failed to create prometheus receiver: %w", err)
 	}
 
-	prw.prometheusRecever = pr
-	return prw.prometheusRecever.Start(ctx, host)
+	prw.prometheusReceiver = pr
+	return prw.prometheusReceiver.Start(ctx, host)
+}
+
+// Deprecated: [v0.55.0] Use getPrometheusConfig instead.
+func getPrometheusConfigWrapper(cfg *Config, params receiver.Settings) (*prometheusreceiver.Config, error) {
+	if cfg.TLSEnabled {
+		params.Logger.Warn("the `tls_config` and 'tls_enabled' settings are deprecated, please use `tls` instead")
+		cfg.ClientConfig.TLSSetting = configtls.ClientConfig{
+			Config: configtls.Config{
+				CAFile:   cfg.TLSConfig.CAFile,
+				CertFile: cfg.TLSConfig.CertFile,
+				KeyFile:  cfg.TLSConfig.KeyFile,
+			},
+			Insecure:           false,
+			InsecureSkipVerify: cfg.TLSConfig.InsecureSkipVerify,
+		}
+	}
+	return getPrometheusConfig(cfg)
 }
 
 func getPrometheusConfig(cfg *Config) (*prometheusreceiver.Config, error) {
@@ -77,22 +92,36 @@ func getPrometheusConfig(cfg *Config) (*prometheusreceiver.Config, error) {
 
 	scheme := "http"
 
-	if cfg.TLSEnabled {
+	tlsConfig, err := cfg.TLSSetting.LoadTLSConfig(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("tls config is not valid: %w", err)
+	}
+	if tlsConfig != nil {
 		scheme = "https"
 		httpConfig.TLSConfig = configutil.TLSConfig{
-			CAFile:             cfg.TLSConfig.CAFile,
-			CertFile:           cfg.TLSConfig.CertFile,
-			KeyFile:            cfg.TLSConfig.KeyFile,
-			InsecureSkipVerify: cfg.TLSConfig.InsecureSkipVerify,
+			CAFile:             cfg.TLSSetting.CAFile,
+			CertFile:           cfg.TLSSetting.CertFile,
+			KeyFile:            cfg.TLSSetting.KeyFile,
+			InsecureSkipVerify: cfg.TLSSetting.InsecureSkipVerify,
 		}
 	}
 
 	httpConfig.BearerToken = configutil.Secret(bearerToken)
 
+	labels := make(model.LabelSet, len(cfg.Labels)+1)
+	for k, v := range cfg.Labels {
+		labels[model.LabelName(k)] = model.LabelValue(v)
+	}
+	labels[model.AddressLabel] = model.LabelValue(cfg.Endpoint)
+
+	jobName := cfg.JobName
+	if jobName == "" {
+		jobName = fmt.Sprintf("%s/%s", metadata.Type, cfg.Endpoint)
+	}
 	scrapeConfig := &config.ScrapeConfig{
 		ScrapeInterval:  model.Duration(cfg.CollectionInterval),
 		ScrapeTimeout:   model.Duration(cfg.CollectionInterval),
-		JobName:         fmt.Sprintf("%s/%s", typeStr, cfg.Endpoint),
+		JobName:         jobName,
 		HonorTimestamps: true,
 		Scheme:          scheme,
 		MetricsPath:     cfg.MetricsPath,
@@ -101,7 +130,7 @@ func getPrometheusConfig(cfg *Config) (*prometheusreceiver.Config, error) {
 			&discovery.StaticConfig{
 				{
 					Targets: []model.LabelSet{
-						{model.AddressLabel: model.LabelValue(cfg.Endpoint)},
+						labels,
 					},
 				},
 			},
@@ -109,14 +138,20 @@ func getPrometheusConfig(cfg *Config) (*prometheusreceiver.Config, error) {
 	}
 
 	scrapeConfig.HTTPClientConfig = httpConfig
-	out.PrometheusConfig = &config.Config{ScrapeConfigs: []*config.ScrapeConfig{
-		scrapeConfig,
-	}}
+	out.PrometheusConfig = &prometheusreceiver.PromConfig{
+		GlobalConfig: config.DefaultGlobalConfig,
+		ScrapeConfigs: []*config.ScrapeConfig{
+			scrapeConfig,
+		},
+	}
 
 	return out, nil
 }
 
 // Shutdown stops the underlying Prometheus receiver.
 func (prw *prometheusReceiverWrapper) Shutdown(ctx context.Context) error {
-	return prw.prometheusRecever.Shutdown(ctx)
+	if prw.prometheusReceiver == nil {
+		return nil
+	}
+	return prw.prometheusReceiver.Shutdown(ctx)
 }
