@@ -1,18 +1,7 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package host
+package host // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awscontainerinsightreceiver/internal/host"
 
 import (
 	"context"
@@ -31,6 +20,7 @@ type ec2MetadataProvider interface {
 	getInstanceID() string
 	getInstanceType() string
 	getRegion() string
+	getInstanceIP() string
 }
 
 type ec2Metadata struct {
@@ -39,18 +29,22 @@ type ec2Metadata struct {
 	refreshInterval  time.Duration
 	instanceID       string
 	instanceType     string
+	instanceIP       string
 	region           string
 	instanceIDReadyC chan bool
+	instanceIPReadyC chan bool
 }
 
 type ec2MetadataOption func(*ec2Metadata)
 
 func newEC2Metadata(ctx context.Context, session *session.Session, refreshInterval time.Duration,
-	instanceIDReadyC chan bool, logger *zap.Logger, options ...ec2MetadataOption) ec2MetadataProvider {
+	instanceIDReadyC chan bool, instanceIPReadyC chan bool, logger *zap.Logger, options ...ec2MetadataOption,
+) ec2MetadataProvider {
 	emd := &ec2Metadata{
 		client:           awsec2metadata.New(session),
 		refreshInterval:  refreshInterval,
 		instanceIDReadyC: instanceIDReadyC,
+		instanceIPReadyC: instanceIPReadyC,
 		logger:           logger,
 	}
 
@@ -59,11 +53,11 @@ func newEC2Metadata(ctx context.Context, session *session.Session, refreshInterv
 	}
 
 	shouldRefresh := func() bool {
-		//stop the refresh once we get instance ID and type successfully
-		return emd.instanceID == "" || emd.instanceType == ""
+		// stop the refresh once we get instance ID and type successfully
+		return emd.instanceID == "" || emd.instanceType == "" || emd.instanceIP == ""
 	}
 
-	go refreshUntil(ctx, emd.refresh, emd.refreshInterval, shouldRefresh, 0)
+	go RefreshUntil(ctx, emd.refresh, emd.refreshInterval, shouldRefresh, 0)
 
 	return emd
 }
@@ -80,10 +74,15 @@ func (emd *ec2Metadata) refresh(ctx context.Context) {
 	emd.instanceID = doc.InstanceID
 	emd.instanceType = doc.InstanceType
 	emd.region = doc.Region
+	emd.instanceIP = doc.PrivateIP
 
 	// notify ec2tags and ebsvolume that the instance id is ready
 	if emd.instanceID != "" {
 		close(emd.instanceIDReadyC)
+	}
+	// notify ecsinfo that the instance id is ready
+	if emd.instanceIP != "" {
+		close(emd.instanceIPReadyC)
 	}
 }
 
@@ -97,4 +96,8 @@ func (emd *ec2Metadata) getInstanceType() string {
 
 func (emd *ec2Metadata) getRegion() string {
 	return emd.region
+}
+
+func (emd *ec2Metadata) getInstanceIP() string {
+	return emd.instanceIP
 }

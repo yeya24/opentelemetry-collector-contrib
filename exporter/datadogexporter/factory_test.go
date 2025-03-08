@@ -1,368 +1,288 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package datadogexporter
 
 import (
 	"context"
-	"encoding/json"
-	"os"
-	"path"
+	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/DataDog/datadog-agent/comp/otelcol/otlp/testutil"
+	"github.com/DataDog/opentelemetry-mapping-go/pkg/inframetadata"
+	"github.com/DataDog/opentelemetry-mapping-go/pkg/inframetadata/payload"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configcheck"
 	"go.opentelemetry.io/collector/config/confignet"
-	"go.opentelemetry.io/collector/config/configtest"
+	"go.opentelemetry.io/collector/config/configretry"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 
-	ddconfig "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/config"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/metadata"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/testutils"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/metadata"
 )
 
-// Test that the factory creates the default configuration
-func TestCreateDefaultConfig(t *testing.T) {
-	factory := NewFactory()
-	cfg := factory.CreateDefaultConfig()
+var _ inframetadata.Pusher = (*testPusher)(nil)
 
-	// Note: the default configuration created by CreateDefaultConfig
-	// still has the unresolved environment variables.
-	assert.Equal(t, &ddconfig.Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-
-		API: ddconfig.APIConfig{
-			Key:  "$DD_API_KEY",
-			Site: "$DD_SITE",
-		},
-
-		Metrics: ddconfig.MetricsConfig{
-			TCPAddr: confignet.TCPAddr{
-				Endpoint: "$DD_URL",
-			},
-			DeltaTTL:      3600,
-			SendMonotonic: true,
-			Quantiles:     true,
-		},
-
-		Traces: ddconfig.TracesConfig{
-			SampleRate: 1,
-			TCPAddr: confignet.TCPAddr{
-				Endpoint: "$DD_APM_URL",
-			},
-			IgnoreResources: []string{},
-		},
-
-		TagsConfig: ddconfig.TagsConfig{
-			Hostname:   "$DD_HOST",
-			Env:        "$DD_ENV",
-			Service:    "$DD_SERVICE",
-			Version:    "$DD_VERSION",
-			EnvVarTags: "$DD_TAGS",
-		},
-
-		SendMetadata:        true,
-		OnlyMetadata:        false,
-		UseResourceMetadata: true,
-	}, cfg, "failed to create default config")
-
-	assert.NoError(t, configcheck.ValidateConfig(cfg))
+type testPusher struct {
+	mu       sync.Mutex
+	payloads []payload.HostMetadata
+	stopped  bool
+	logger   *zap.Logger
+	t        *testing.T
 }
 
-// TestLoadConfig tests that the configuration is loaded correctly
-func TestLoadConfig(t *testing.T) {
-	factories, err := componenttest.NopFactories()
-	assert.NoError(t, err)
-
-	factory := NewFactory()
-	factories.Exporters[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
-
-	require.NoError(t, err)
-	require.NotNil(t, cfg)
-
-	apiConfig := cfg.Exporters[config.NewIDWithName(typeStr, "api")].(*ddconfig.Config)
-	err = apiConfig.Sanitize()
-
-	require.NoError(t, err)
-	assert.Equal(t, &ddconfig.Config{
-		ExporterSettings: config.NewExporterSettings(config.NewIDWithName(typeStr, "api")),
-		TagsConfig: ddconfig.TagsConfig{
-			Hostname:   "customhostname",
-			Env:        "prod",
-			Service:    "myservice",
-			Version:    "myversion",
-			EnvVarTags: "",
-			Tags:       []string{"example:tag"},
-		},
-
-		API: ddconfig.APIConfig{
-			Key:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			Site: "datadoghq.eu",
-		},
-
-		Metrics: ddconfig.MetricsConfig{
-			TCPAddr: confignet.TCPAddr{
-				Endpoint: "https://api.datadoghq.eu",
-			},
-			DeltaTTL:      3600,
-			SendMonotonic: true,
-			Quantiles:     true,
-		},
-
-		Traces: ddconfig.TracesConfig{
-			SampleRate: 1,
-			TCPAddr: confignet.TCPAddr{
-				Endpoint: "https://trace.agent.datadoghq.eu",
-			},
-			IgnoreResources: []string{},
-		},
-		SendMetadata:        true,
-		OnlyMetadata:        false,
-		UseResourceMetadata: true,
-	}, apiConfig)
-
-	defaultConfig := cfg.Exporters[config.NewIDWithName(typeStr, "default")].(*ddconfig.Config)
-	err = defaultConfig.Sanitize()
-
-	require.NoError(t, err)
-	assert.Equal(t, &ddconfig.Config{
-		ExporterSettings: config.NewExporterSettings(config.NewIDWithName(typeStr, "default")),
-		TagsConfig: ddconfig.TagsConfig{
-			Hostname:   "",
-			Env:        "none",
-			Service:    "",
-			Version:    "",
-			EnvVarTags: "",
-		},
-
-		API: ddconfig.APIConfig{
-			Key:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			Site: "datadoghq.com",
-		},
-
-		Metrics: ddconfig.MetricsConfig{
-			TCPAddr: confignet.TCPAddr{
-				Endpoint: "https://api.datadoghq.com",
-			},
-			SendMonotonic: true,
-			DeltaTTL:      3600,
-			Quantiles:     true,
-		},
-
-		Traces: ddconfig.TracesConfig{
-			SampleRate: 1,
-			TCPAddr: confignet.TCPAddr{
-				Endpoint: "https://trace.agent.datadoghq.com",
-			},
-			IgnoreResources: []string{},
-		},
-		SendMetadata:        true,
-		OnlyMetadata:        false,
-		UseResourceMetadata: true,
-	}, defaultConfig)
-
-	invalidConfig := cfg.Exporters[config.NewIDWithName(typeStr, "invalid")].(*ddconfig.Config)
-	err = invalidConfig.Sanitize()
-	require.Error(t, err)
+func newTestPusher(t *testing.T) *testPusher {
+	return &testPusher{
+		logger: zaptest.NewLogger(t),
+		t:      t,
+	}
 }
 
-// TestLoadConfigEnvVariables tests that the loading configuration takes into account
-// environment variables for default values
-func TestLoadConfigEnvVariables(t *testing.T) {
-	assert.NoError(t, os.Setenv("DD_API_KEY", "replacedapikey"))
-	assert.NoError(t, os.Setenv("DD_HOST", "testhost"))
-	assert.NoError(t, os.Setenv("DD_ENV", "testenv"))
-	assert.NoError(t, os.Setenv("DD_SERVICE", "testservice"))
-	assert.NoError(t, os.Setenv("DD_VERSION", "testversion"))
-	assert.NoError(t, os.Setenv("DD_SITE", "datadoghq.test"))
-	assert.NoError(t, os.Setenv("DD_TAGS", "envexample:tag envexample2:tag"))
-	assert.NoError(t, os.Setenv("DD_URL", "https://api.datadoghq.com"))
-	assert.NoError(t, os.Setenv("DD_APM_URL", "https://trace.agent.datadoghq.com"))
+func (p *testPusher) Push(_ context.Context, hm payload.HostMetadata) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stopped {
+		p.logger.Error("Trying to push payload after stopping", zap.Any("payload", hm))
+		p.t.Fail()
+	}
+	p.logger.Info("Storing host metadata payload", zap.Any("payload", hm))
+	p.payloads = append(p.payloads, hm)
+	return nil
+}
 
-	defer func() {
-		assert.NoError(t, os.Unsetenv("DD_API_KEY"))
-		assert.NoError(t, os.Unsetenv("DD_HOST"))
-		assert.NoError(t, os.Unsetenv("DD_ENV"))
-		assert.NoError(t, os.Unsetenv("DD_SERVICE"))
-		assert.NoError(t, os.Unsetenv("DD_VERSION"))
-		assert.NoError(t, os.Unsetenv("DD_SITE"))
-		assert.NoError(t, os.Unsetenv("DD_TAGS"))
-		assert.NoError(t, os.Unsetenv("DD_URL"))
-		assert.NoError(t, os.Unsetenv("DD_APM_URL"))
-	}()
-
-	factories, err := componenttest.NopFactories()
-	assert.NoError(t, err)
-
-	factory := NewFactory()
-	factories.Exporters[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
-
-	require.NoError(t, err)
-	require.NotNil(t, cfg)
-
-	apiConfig := cfg.Exporters[config.NewIDWithName(typeStr, "api2")].(*ddconfig.Config)
-	err = apiConfig.Sanitize()
-
-	// Check that settings with env variables get overridden when explicitly set in config
-	require.NoError(t, err)
-	assert.Equal(t, &ddconfig.Config{
-		ExporterSettings: config.NewExporterSettings(config.NewIDWithName(typeStr, "api2")),
-
-		TagsConfig: ddconfig.TagsConfig{
-			Hostname:   "customhostname",
-			Env:        "prod",
-			Service:    "myservice",
-			Version:    "myversion",
-			EnvVarTags: "envexample:tag envexample2:tag",
-			Tags:       []string{"example:tag"},
-		},
-
-		API: ddconfig.APIConfig{
-			Key:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			Site: "datadoghq.eu",
-		},
-
-		Metrics: ddconfig.MetricsConfig{
-			TCPAddr: confignet.TCPAddr{
-				Endpoint: "https://api.datadoghq.test",
-			},
-			SendMonotonic: true,
-			Quantiles:     false,
-			DeltaTTL:      3600,
-		},
-
-		Traces: ddconfig.TracesConfig{
-			SampleRate: 1,
-			TCPAddr: confignet.TCPAddr{
-				Endpoint: "https://trace.agent.datadoghq.test",
-			},
-			IgnoreResources: []string{},
-		},
-		SendMetadata:        true,
-		OnlyMetadata:        false,
-		UseResourceMetadata: true,
-	}, apiConfig)
-
-	defaultConfig := cfg.Exporters[config.NewIDWithName(typeStr, "default2")].(*ddconfig.Config)
-	err = defaultConfig.Sanitize()
-
-	require.NoError(t, err)
-
-	// Check that settings with env variables get taken into account when
-	// no settings are given.
-	assert.Equal(t, &ddconfig.Config{
-		ExporterSettings: config.NewExporterSettings(config.NewIDWithName(typeStr, "default2")),
-
-		TagsConfig: ddconfig.TagsConfig{
-			Hostname:   "testhost",
-			Env:        "testenv",
-			Service:    "testservice",
-			Version:    "testversion",
-			EnvVarTags: "envexample:tag envexample2:tag",
-		},
-
-		API: ddconfig.APIConfig{
-			Key:  "replacedapikey",
-			Site: "datadoghq.test",
-		},
-
-		Metrics: ddconfig.MetricsConfig{
-			TCPAddr: confignet.TCPAddr{
-				Endpoint: "https://api.datadoghq.com",
-			},
-			SendMonotonic: true,
-			DeltaTTL:      3600,
-			Quantiles:     true,
-		},
-
-		Traces: ddconfig.TracesConfig{
-			SampleRate: 1,
-			TCPAddr: confignet.TCPAddr{
-				Endpoint: "https://trace.agent.datadoghq.com",
-			},
-			IgnoreResources: []string{},
-		},
-		SendMetadata:        true,
-		OnlyMetadata:        false,
-		UseResourceMetadata: true,
-	}, defaultConfig)
+func (p *testPusher) Payloads() []payload.HostMetadata {
+	p.mu.Lock()
+	p.stopped = true
+	defer p.mu.Unlock()
+	return p.payloads
 }
 
 func TestCreateAPIMetricsExporter(t *testing.T) {
-	server := testutils.DatadogServerMock()
+	server := testutil.DatadogServerMock()
 	defer server.Close()
 
-	logger := zap.NewNop()
-
-	factories, err := componenttest.NopFactories()
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)
-
 	factory := NewFactory()
-	factories.Exporters[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
+	cfg := factory.CreateDefaultConfig()
 
+	sub, err := cm.Sub(component.NewIDWithName(metadata.Type, "api").String())
 	require.NoError(t, err)
-	require.NotNil(t, cfg)
+	require.NoError(t, sub.Unmarshal(cfg))
 
-	// Use the mock server for API key validation
-	c := (cfg.Exporters[config.NewIDWithName(typeStr, "api")]).(*ddconfig.Config)
-	c.Metrics.TCPAddr.Endpoint = server.URL
-	c.SendMetadata = false
+	c := cfg.(*Config)
+	c.Metrics.TCPAddrConfig.Endpoint = server.URL
+	c.HostMetadata.Enabled = false
 
 	ctx := context.Background()
-	exp, err := factory.CreateMetricsExporter(
+	exp, err := factory.CreateMetrics(
 		ctx,
-		component.ExporterCreateSettings{Logger: logger},
-		cfg.Exporters[config.NewIDWithName(typeStr, "api")],
+		exportertest.NewNopSettings(metadata.Type),
+		cfg,
 	)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, exp)
 }
 
-func TestCreateAPITracesExporter(t *testing.T) {
-	server := testutils.DatadogServerMock()
+func TestCreateAPIExporterFailOnInvalidKey_Zorkian(t *testing.T) {
+	featuregateErr := featuregate.GlobalRegistry().Set("exporter.datadogexporter.UseLogsAgentExporter", false)
+	assert.NoError(t, featuregateErr)
+	server := testutil.DatadogServerMock(testutil.ValidateAPIKeyEndpointInvalid)
 	defer server.Close()
 
-	logger := zap.NewNop()
+	if isMetricExportV2Enabled() {
+		require.NoError(t, enableZorkianMetricExport())
+		defer require.NoError(t, enableNativeMetricExport())
+	}
 
-	factories, err := componenttest.NopFactories()
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)
-
 	factory := NewFactory()
-	factories.Exporters[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
+	cfg := factory.CreateDefaultConfig()
 
+	sub, err := cm.Sub(component.NewIDWithName(metadata.Type, "api").String())
 	require.NoError(t, err)
-	require.NotNil(t, cfg)
+	require.NoError(t, sub.Unmarshal(cfg))
 
 	// Use the mock server for API key validation
-	c := (cfg.Exporters[config.NewIDWithName(typeStr, "api")]).(*ddconfig.Config)
-	c.Metrics.TCPAddr.Endpoint = server.URL
-	c.SendMetadata = false
+	c := cfg.(*Config)
+	c.Metrics.TCPAddrConfig.Endpoint = server.URL
+	c.HostMetadata.Enabled = false
+
+	t.Run("true", func(t *testing.T) {
+		c.API.FailOnInvalidKey = true
+		ctx := context.Background()
+		// metrics exporter
+		mexp, err := factory.CreateMetrics(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.EqualError(t, err, "API Key validation failed")
+		assert.Nil(t, mexp)
+
+		texp, err := factory.CreateTraces(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.EqualError(t, err, "API Key validation failed")
+		assert.Nil(t, texp)
+
+		lexp, err := factory.CreateLogs(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.EqualError(t, err, "API Key validation failed")
+		assert.Nil(t, lexp)
+	})
+	t.Run("false", func(t *testing.T) {
+		c.API.FailOnInvalidKey = false
+		ctx := context.Background()
+		exp, err := factory.CreateMetrics(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.NoError(t, err)
+		assert.NotNil(t, exp)
+
+		texp, err := factory.CreateTraces(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.NoError(t, err)
+		assert.NotNil(t, texp)
+
+		lexp, err := factory.CreateLogs(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.NoError(t, err)
+		assert.NotNil(t, lexp)
+	})
+	featuregateErr = featuregate.GlobalRegistry().Set("exporter.datadogexporter.UseLogsAgentExporter", true)
+	assert.NoError(t, featuregateErr)
+}
+
+func TestCreateAPIExporterFailOnInvalidKey(t *testing.T) {
+	featuregateErr := featuregate.GlobalRegistry().Set("exporter.datadogexporter.UseLogsAgentExporter", false)
+	assert.NoError(t, featuregateErr)
+	server := testutil.DatadogServerMock(testutil.ValidateAPIKeyEndpointInvalid)
+	defer server.Close()
+
+	if !isMetricExportV2Enabled() {
+		require.NoError(t, enableNativeMetricExport())
+		defer require.NoError(t, enableZorkianMetricExport())
+	}
+
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+	require.NoError(t, err)
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig()
+
+	sub, err := cm.Sub(component.NewIDWithName(metadata.Type, "api").String())
+	require.NoError(t, err)
+	require.NoError(t, sub.Unmarshal(cfg))
+
+	// Use the mock server for API key validation
+	c := cfg.(*Config)
+	c.Metrics.TCPAddrConfig.Endpoint = server.URL
+	c.HostMetadata.Enabled = false
+
+	t.Run("true", func(t *testing.T) {
+		c.API.FailOnInvalidKey = true
+		ctx := context.Background()
+		// metrics exporter
+		mexp, err := factory.CreateMetrics(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.EqualError(t, err, "API Key validation failed")
+		assert.Nil(t, mexp)
+
+		texp, err := factory.CreateTraces(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.EqualError(t, err, "API Key validation failed")
+		assert.Nil(t, texp)
+
+		lexp, err := factory.CreateLogs(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.EqualError(t, err, "API Key validation failed")
+		assert.Nil(t, lexp)
+	})
+	t.Run("false", func(t *testing.T) {
+		c.API.FailOnInvalidKey = false
+		ctx := context.Background()
+		exp, err := factory.CreateMetrics(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.NoError(t, err)
+		assert.NotNil(t, exp)
+
+		texp, err := factory.CreateTraces(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.NoError(t, err)
+		assert.NotNil(t, texp)
+
+		lexp, err := factory.CreateLogs(
+			ctx,
+			exportertest.NewNopSettings(metadata.Type),
+			cfg,
+		)
+		assert.NoError(t, err)
+		assert.NotNil(t, lexp)
+	})
+	featuregateErr = featuregate.GlobalRegistry().Set("exporter.datadogexporter.UseLogsAgentExporter", true)
+	assert.NoError(t, featuregateErr)
+}
+
+func TestCreateAPILogsExporter(t *testing.T) {
+	server := testutil.DatadogLogServerMock()
+	defer server.Close()
+
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+	require.NoError(t, err)
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig()
+
+	sub, err := cm.Sub(component.NewIDWithName(metadata.Type, "api").String())
+	require.NoError(t, err)
+	require.NoError(t, sub.Unmarshal(cfg))
+
+	c := cfg.(*Config)
+	c.Metrics.TCPAddrConfig.Endpoint = server.URL
+	c.HostMetadata.Enabled = false
 
 	ctx := context.Background()
-	exp, err := factory.CreateTracesExporter(
+	exp, err := factory.CreateLogs(
 		ctx,
-		component.ExporterCreateSettings{Logger: logger},
-		cfg.Exporters[config.NewIDWithName(typeStr, "api")],
+		exportertest.NewNopSettings(metadata.Type),
+		cfg,
 	)
 
 	assert.NoError(t, err)
@@ -370,51 +290,111 @@ func TestCreateAPITracesExporter(t *testing.T) {
 }
 
 func TestOnlyMetadata(t *testing.T) {
-	server := testutils.DatadogServerMock()
+	server := testutil.DatadogServerMock()
 	defer server.Close()
-	logger := zap.NewNop()
-
-	factories, err := componenttest.NopFactories()
-	require.NoError(t, err)
 
 	factory := NewFactory()
-	factories.Exporters[typeStr] = factory
-
 	ctx := context.Background()
-	cfg := &ddconfig.Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-		API:              ddconfig.APIConfig{Key: "notnull"},
-		Metrics:          ddconfig.MetricsConfig{TCPAddr: confignet.TCPAddr{Endpoint: server.URL}},
-		Traces:           ddconfig.TracesConfig{TCPAddr: confignet.TCPAddr{Endpoint: server.URL}},
+	cfg := &Config{
+		ClientConfig:  defaultClientConfig(),
+		BackOffConfig: configretry.NewDefaultBackOffConfig(),
+		QueueSettings: exporterhelper.NewDefaultQueueConfig(),
 
-		SendMetadata:        true,
-		OnlyMetadata:        true,
-		UseResourceMetadata: true,
+		API:          APIConfig{Key: "aaaaaaa"},
+		Metrics:      MetricsConfig{TCPAddrConfig: confignet.TCPAddrConfig{Endpoint: server.URL}},
+		Traces:       TracesConfig{TCPAddrConfig: confignet.TCPAddrConfig{Endpoint: server.URL}},
+		OnlyMetadata: true,
+
+		HostMetadata: HostMetadataConfig{
+			Enabled:        true,
+			HostnameSource: HostnameSourceFirstResource,
+			ReporterPeriod: 30 * time.Minute,
+		},
 	}
+	cfg.HostMetadata.SetSourceTimeout(50 * time.Millisecond)
 
-	expTraces, err := factory.CreateTracesExporter(
+	expTraces, err := factory.CreateTraces(
 		ctx,
-		component.ExporterCreateSettings{Logger: logger},
+		exportertest.NewNopSettings(metadata.Type),
 		cfg,
 	)
 	assert.NoError(t, err)
 	assert.NotNil(t, expTraces)
 
-	expMetrics, err := factory.CreateMetricsExporter(
+	expMetrics, err := factory.CreateMetrics(
 		ctx,
-		component.ExporterCreateSettings{Logger: logger},
+		exportertest.NewNopSettings(metadata.Type),
 		cfg,
 	)
 	assert.NoError(t, err)
 	assert.NotNil(t, expMetrics)
 
-	err = expTraces.ConsumeTraces(ctx, testutils.TestTraces.Clone())
+	err = expTraces.Start(ctx, nil)
+	assert.NoError(t, err)
+	defer func() {
+		assert.NoError(t, expTraces.Shutdown(ctx))
+	}()
+
+	testTraces := ptrace.NewTraces()
+	testutil.TestTraces.CopyTo(testTraces)
+	err = expTraces.ConsumeTraces(ctx, testTraces)
 	require.NoError(t, err)
 
-	body := <-server.MetadataChan
-	var recvMetadata metadata.HostMetadata
-	err = json.Unmarshal(body, &recvMetadata)
-	require.NoError(t, err)
-	assert.Equal(t, recvMetadata.InternalHostname, "custom-hostname")
+	recvMetadata := <-server.MetadataChan
+	assert.Equal(t, "custom-hostname", recvMetadata.InternalHostname)
+}
 
+func TestStopExporters(t *testing.T) {
+	server := testutil.DatadogServerMock()
+	defer server.Close()
+
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+	require.NoError(t, err)
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig()
+
+	sub, err := cm.Sub(component.NewIDWithName(metadata.Type, "api").String())
+	require.NoError(t, err)
+	require.NoError(t, sub.Unmarshal(cfg))
+
+	c := cfg.(*Config)
+	c.Metrics.TCPAddrConfig.Endpoint = server.URL
+	c.HostMetadata.Enabled = false
+
+	ctx := context.Background()
+	expTraces, err := factory.CreateTraces(
+		ctx,
+		exportertest.NewNopSettings(metadata.Type),
+		cfg,
+	)
+	assert.NoError(t, err)
+	assert.NotNil(t, expTraces)
+	expMetrics, err := factory.CreateMetrics(
+		ctx,
+		exportertest.NewNopSettings(metadata.Type),
+		cfg,
+	)
+	assert.NoError(t, err)
+	assert.NotNil(t, expMetrics)
+
+	err = expTraces.Start(ctx, nil)
+	assert.NoError(t, err)
+	err = expMetrics.Start(ctx, nil)
+	assert.NoError(t, err)
+
+	finishShutdown := make(chan bool)
+	go func() {
+		err = expMetrics.Shutdown(ctx)
+		assert.NoError(t, err)
+		err = expTraces.Shutdown(ctx)
+		assert.NoError(t, err)
+		finishShutdown <- true
+	}()
+
+	select {
+	case <-finishShutdown:
+		break
+	case <-time.After(time.Second * 10):
+		t.Fatal("Timed out")
+	}
 }

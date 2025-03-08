@@ -1,18 +1,7 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package ecsobserver
+package ecsobserver // import "github.com/open-telemetry/opentelemetry-collector-contrib/extension/observer/ecsobserver"
 
 import (
 	"fmt"
@@ -29,16 +18,16 @@ type ServiceConfig struct {
 	// NamePattern is mandatory.
 	NamePattern string `mapstructure:"name_pattern" yaml:"name_pattern"`
 	// ContainerNamePattern is optional, empty string means all containers in that service would be exported.
-	// Otherwise both service and container name petterns need to metch.
+	// Otherwise both service and container name patterns need to match.
 	ContainerNamePattern string `mapstructure:"container_name_pattern" yaml:"container_name_pattern"`
 }
 
 func (s *ServiceConfig) validate() error {
-	_, err := s.newMatcher(MatcherOptions{})
+	_, err := s.newMatcher(matcherOptions{})
 	return err
 }
 
-func (s *ServiceConfig) newMatcher(opts MatcherOptions) (Matcher, error) {
+func (s *ServiceConfig) newMatcher(opts matcherOptions) (targetMatcher, error) {
 	if s.NamePattern == "" {
 		return nil, fmt.Errorf("name_pattern is empty")
 	}
@@ -68,11 +57,11 @@ func (s *ServiceConfig) newMatcher(opts MatcherOptions) (Matcher, error) {
 }
 
 func serviceConfigsToMatchers(cfgs []ServiceConfig) []matcherConfig {
-	var matchers []matcherConfig
-	for _, cfg := range cfgs {
+	matchers := make([]matcherConfig, len(cfgs))
+	for i, cfg := range cfgs {
 		// NOTE: &cfg points to the temp var, whose value would end up be the last one in the slice.
 		copied := cfg
-		matchers = append(matchers, &copied)
+		matchers[i] = &copied
 	}
 	return matchers
 }
@@ -86,11 +75,11 @@ type serviceMatcher struct {
 	exportSetting      *commonExportSetting
 }
 
-func (s *serviceMatcher) Type() MatcherType {
-	return MatcherTypeService
+func (s *serviceMatcher) matcherType() matcherType {
+	return matcherTypeService
 }
 
-func (s *serviceMatcher) MatchTargets(t *Task, c *ecs.ContainerDefinition) ([]MatchedTarget, error) {
+func (s *serviceMatcher) matchTargets(t *taskAnnotated, c *ecs.ContainerDefinition) ([]matchedTarget, error) {
 	// Service info is only attached for tasks whose services are included in config.
 	// However, Match is called on tasks so we need to guard nil pointer.
 	if t.Service == nil {
@@ -101,4 +90,30 @@ func (s *serviceMatcher) MatchTargets(t *Task, c *ecs.ContainerDefinition) ([]Ma
 	}
 	// The rest is same as taskDefinitionMatcher
 	return matchContainerByName(s.containerNameRegex, s.exportSetting, c)
+}
+
+// serviceConfigsToFilter reduce number of describe service API call
+func serviceConfigsToFilter(cfgs []ServiceConfig) (serviceNameFilter, error) {
+	// If no service config, don't describe any services
+	if len(cfgs) == 0 {
+		return func(_ string) bool {
+			return false
+		}, nil
+	}
+	regs := make([]*regexp.Regexp, len(cfgs))
+	for i, cfg := range cfgs {
+		r, err := regexp.Compile(cfg.NamePattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid service name pattern %q: %w", cfg.NamePattern, err)
+		}
+		regs[i] = r
+	}
+	return func(name string) bool {
+		for _, r := range regs {
+			if r.MatchString(name) {
+				return true
+			}
+		}
+		return false
+	}, nil
 }

@@ -1,82 +1,87 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package loadbalancingexporter
+package loadbalancingexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/loadbalancingexporter"
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
-	"go.opencensus.io/stats"
-	"go.opencensus.io/tag"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/consumer/consumererror"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/otlpexporter"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/otel/metric"
+	"go.uber.org/multierr"
 	"go.uber.org/zap"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/loadbalancingexporter/internal/metadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/batchpersignal"
 )
 
-var _ component.TracesExporter = (*traceExporterImp)(nil)
-
-var (
-	errNoTracesInBatch = errors.New("no traces were found in the batch")
+const (
+	pseudoAttrSpanName = "span.name"
+	pseudoAttrSpanKind = "span.kind"
 )
 
+var _ exporter.Traces = (*traceExporterImp)(nil)
+
+type exporterTraces map[*wrappedExporter]ptrace.Traces
+
 type traceExporterImp struct {
-	logger *zap.Logger
+	loadBalancer *loadBalancer
+	routingKey   routingKey
+	routingAttrs []string
 
-	loadBalancer loadBalancer
-
+	logger     *zap.Logger
 	stopped    bool
 	shutdownWg sync.WaitGroup
+	telemetry  *metadata.TelemetryBuilder
 }
 
 // Create new traces exporter
-func newTracesExporter(params component.ExporterCreateSettings, cfg config.Exporter) (*traceExporterImp, error) {
-	exporterFactory := otlpexporter.NewFactory()
-
-	tmplParams := component.ExporterCreateSettings{
-		Logger:    params.Logger,
-		BuildInfo: params.BuildInfo,
-	}
-
-	loadBalancer, err := newLoadBalancer(params, cfg, func(ctx context.Context, endpoint string) (component.Exporter, error) {
-		oCfg := buildExporterConfig(cfg.(*Config), endpoint)
-		return exporterFactory.CreateTracesExporter(ctx, tmplParams, &oCfg)
-	})
+func newTracesExporter(params exporter.Settings, cfg component.Config) (*traceExporterImp, error) {
+	telemetry, err := metadata.NewTelemetryBuilder(params.TelemetrySettings)
 	if err != nil {
 		return nil, err
 	}
 
-	return &traceExporterImp{
-		logger:       params.Logger,
-		loadBalancer: loadBalancer,
-	}, nil
-}
+	exporterFactory := otlpexporter.NewFactory()
+	cfFunc := func(ctx context.Context, endpoint string) (component.Component, error) {
+		oCfg := buildExporterConfig(cfg.(*Config), endpoint)
+		oParams := buildExporterSettings(exporterFactory.Type(), params, endpoint)
 
-func buildExporterConfig(cfg *Config, endpoint string) otlpexporter.Config {
-	oCfg := cfg.Protocol.OTLP
-	oCfg.ExporterSettings = config.NewExporterSettings(config.NewID("otlp"))
-	oCfg.Endpoint = endpoint
-	return oCfg
+		return exporterFactory.CreateTraces(ctx, oParams, &oCfg)
+	}
+
+	lb, err := newLoadBalancer(params.Logger, cfg, cfFunc, telemetry)
+	if err != nil {
+		return nil, err
+	}
+
+	traceExporter := traceExporterImp{
+		loadBalancer: lb,
+		routingKey:   traceIDRouting,
+		telemetry:    telemetry,
+		logger:       params.Logger,
+	}
+
+	switch cfg.(*Config).RoutingKey {
+	case svcRoutingStr:
+		traceExporter.routingKey = svcRouting
+	case attrRoutingStr:
+		traceExporter.routingKey = attrRouting
+		traceExporter.routingAttrs = cfg.(*Config).RoutingAttributes
+	case traceIDRoutingStr, "":
+	default:
+		return nil, fmt.Errorf("unsupported routing_key: %s", cfg.(*Config).RoutingKey)
+	}
+	return &traceExporter, nil
 }
 
 func (e *traceExporterImp) Capabilities() consumer.Capabilities {
@@ -87,73 +92,151 @@ func (e *traceExporterImp) Start(ctx context.Context, host component.Host) error
 	return e.loadBalancer.Start(ctx, host)
 }
 
-func (e *traceExporterImp) Shutdown(context.Context) error {
+func (e *traceExporterImp) Shutdown(ctx context.Context) error {
+	err := e.loadBalancer.Shutdown(ctx)
 	e.stopped = true
 	e.shutdownWg.Wait()
-	return nil
-}
-
-func (e *traceExporterImp) ConsumeTraces(ctx context.Context, td pdata.Traces) error {
-	var errors []error
-	batches := batchpersignal.SplitTraces(td)
-	for _, batch := range batches {
-		if err := e.consumeTrace(ctx, batch); err != nil {
-			errors = append(errors, err)
-		}
-	}
-
-	return consumererror.Combine(errors)
-}
-
-func (e *traceExporterImp) consumeTrace(ctx context.Context, td pdata.Traces) error {
-	traceID := traceIDFromTraces(td)
-	if traceID == pdata.InvalidTraceID() {
-		return errNoTracesInBatch
-	}
-
-	endpoint := e.loadBalancer.Endpoint(traceID)
-	exp, err := e.loadBalancer.Exporter(endpoint)
-	if err != nil {
-		return err
-	}
-
-	te, ok := exp.(component.TracesExporter)
-	if !ok {
-		expectType := (*component.TracesExporter)(nil)
-		return fmt.Errorf("expected %T but got %T", expectType, exp)
-	}
-
-	start := time.Now()
-	err = te.ConsumeTraces(ctx, td)
-	duration := time.Since(start)
-	ctx, _ = tag.New(ctx, tag.Upsert(tag.MustNewKey("endpoint"), endpoint))
-
-	if err == nil {
-		sCtx, _ := tag.New(ctx, tag.Upsert(tag.MustNewKey("success"), "true"))
-		stats.Record(sCtx, mBackendLatency.M(duration.Milliseconds()))
-	} else {
-		fCtx, _ := tag.New(ctx, tag.Upsert(tag.MustNewKey("success"), "false"))
-		stats.Record(fCtx, mBackendLatency.M(duration.Milliseconds()))
-	}
-
 	return err
 }
 
-func traceIDFromTraces(td pdata.Traces) pdata.TraceID {
-	rs := td.ResourceSpans()
-	if rs.Len() == 0 {
-		return pdata.InvalidTraceID()
+func (e *traceExporterImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
+	batches := batchpersignal.SplitTraces(td)
+
+	exporterSegregatedTraces := make(exporterTraces)
+	endpoints := make(map[*wrappedExporter]string)
+	for _, batch := range batches {
+		routingID, err := routingIdentifiersFromTraces(batch, e.routingKey, e.routingAttrs)
+		if err != nil {
+			return err
+		}
+
+		for rid := range routingID {
+			exp, endpoint, err := e.loadBalancer.exporterAndEndpoint([]byte(rid))
+			if err != nil {
+				return err
+			}
+
+			_, ok := exporterSegregatedTraces[exp]
+			if !ok {
+				exp.consumeWG.Add(1)
+				exporterSegregatedTraces[exp] = ptrace.NewTraces()
+			}
+			exporterSegregatedTraces[exp] = mergeTraces(exporterSegregatedTraces[exp], batch)
+
+			endpoints[exp] = endpoint
+		}
 	}
 
-	ils := rs.At(0).InstrumentationLibrarySpans()
+	var errs error
+
+	for exp, td := range exporterSegregatedTraces {
+		start := time.Now()
+		err := exp.ConsumeTraces(ctx, td)
+		exp.consumeWG.Done()
+		errs = multierr.Append(errs, err)
+		duration := time.Since(start)
+		e.telemetry.LoadbalancerBackendLatency.Record(ctx, duration.Milliseconds(), metric.WithAttributeSet(exp.endpointAttr))
+		if err == nil {
+			e.telemetry.LoadbalancerBackendOutcome.Add(ctx, 1, metric.WithAttributeSet(exp.successAttr))
+		} else {
+			e.telemetry.LoadbalancerBackendOutcome.Add(ctx, 1, metric.WithAttributeSet(exp.failureAttr))
+			e.logger.Debug("failed to export traces", zap.Error(err))
+		}
+	}
+
+	return errs
+}
+
+// routingIdentifiersFromTraces reads the traces and determines an identifier that can be used to define a position on the
+// ring hash. It takes the routingKey, defining what type of routing should be used, and a series of attributes
+// (optionally) used if the routingKey is attrRouting.
+//
+// only svcRouting and attrRouting are supported. For attrRouting, any attribute, as well the "pseudo" attributes span.name
+// and span.kind are supported.
+//
+// In practice, makes the assumption that ptrace.Traces includes only one trace of each kind, in the "trace tree".
+func routingIdentifiersFromTraces(td ptrace.Traces, rType routingKey, attrs []string) (map[string]bool, error) {
+	ids := make(map[string]bool)
+	rs := td.ResourceSpans()
+	if rs.Len() == 0 {
+		return nil, errors.New("empty resource spans")
+	}
+
+	ils := rs.At(0).ScopeSpans()
 	if ils.Len() == 0 {
-		return pdata.InvalidTraceID()
+		return nil, errors.New("empty scope spans")
 	}
 
 	spans := ils.At(0).Spans()
 	if spans.Len() == 0 {
-		return pdata.InvalidTraceID()
+		return nil, errors.New("empty spans")
+	}
+	// Determine how the key should be populated.
+	switch rType {
+	case traceIDRouting:
+		// The simple case is the TraceID routing. In this case, we just use the string representation of the Trace ID.
+		tid := spans.At(0).TraceID()
+		ids[string(tid[:])] = true
+
+		return ids, nil
+	case svcRouting:
+		// Service Name is still handled as an "attribute router", it's just expressed as a "pseudo attribute"
+		attrs = []string{"service.name"}
+	case attrRouting:
+		// By default, we'll just use the input provided.
+		break
+	default:
+		return nil, fmt.Errorf("unsupported routing_key: %d", rType)
 	}
 
-	return spans.At(0).TraceID()
+	// Composite the attributes together as a key.
+	for i := 0; i < rs.Len(); i++ {
+		// rKey will never return an error. See
+		// 1. https://pkg.go.dev/bytes#Buffer.Write
+		// 2. https://stackoverflow.com/a/70388629
+		var rKey strings.Builder
+
+		for _, a := range attrs {
+			// resource spans
+			rAttr, ok := rs.At(i).Resource().Attributes().Get(a)
+			if ok {
+				rKey.WriteString(rAttr.Str())
+				continue
+			}
+
+			// ils or "instrumentation library spans"
+			ils := rs.At(0).ScopeSpans()
+			iAttr, ok := ils.At(0).Scope().Attributes().Get(a)
+			if ok {
+				rKey.WriteString(iAttr.Str())
+				continue
+			}
+
+			// the lowest level span (or what engineers regularly interact with)
+			spans := ils.At(0).Spans()
+
+			if a == pseudoAttrSpanKind {
+				rKey.WriteString(spans.At(0).Kind().String())
+
+				continue
+			}
+
+			if a == pseudoAttrSpanName {
+				rKey.WriteString(spans.At(0).Name())
+
+				continue
+			}
+
+			sAttr, ok := spans.At(0).Attributes().Get(a)
+			if ok {
+				rKey.WriteString(sAttr.Str())
+				continue
+			}
+		}
+
+		// No matter what, there will be a key here (even if that key is "").
+		ids[rKey.String()] = true
+	}
+
+	return ids, nil
 }

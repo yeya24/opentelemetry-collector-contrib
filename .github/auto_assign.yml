@@ -10,17 +10,27 @@ useAssigneeGroups: true
 # A list of assignees, split into different groups, to be added to pull requests (GitHub user name)
 assigneeGroups:
   approvers_maintainers:
-    - Aneurysm9
-    - anuraaga
+    # Approvers
+    # - ChrsMark on leave
+    - crobert-1
+    # - dashpole on leave
+    - dehaansa
+    - edmocosta
+    - mwear
+    - songy23
+    - fatsheep9146
+    # Maintainers
+    - andrzej-stencel
+    - atoulme
+    - bogdandrutu
+    - codeboten
     - djaglowski
     - dmitryax
-    - jrcamp
+    - evan-bradley
     - jpkrohling
-    - kbrockhoff
+    - MovieStoreGuy
     - mx-psi
-    - owais
-    - bogdandrutu
-    - tigrannajaryan
+    - TylerHelmuth
 
 # A number of assignees added to the pull request
 # Set 0 to add all the assignees (default: 0)

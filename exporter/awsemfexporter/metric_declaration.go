@@ -1,18 +1,7 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package awsemfexporter
+package awsemfexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsemfexporter"
 
 import (
 	"bytes"
@@ -76,9 +65,9 @@ func dedupDimensionSet(dimensions []string) (deduped []string, hasDuplicate bool
 	return
 }
 
-// Init initializes the MetricDeclaration struct. Performs validation and compiles
+// init initializes the MetricDeclaration struct. Performs validation and compiles
 // regex strings. Dimensions are deduped and sorted.
-func (m *MetricDeclaration) Init(logger *zap.Logger) (err error) {
+func (m *MetricDeclaration) init(logger *zap.Logger) (err error) {
 	// Return error if no metric name selectors are defined
 	if len(m.MetricNameSelectors) == 0 {
 		return errors.New("invalid metric declaration: no metric name selectors defined")
@@ -121,7 +110,7 @@ func (m *MetricDeclaration) Init(logger *zap.Logger) (err error) {
 
 	// Initialize label matchers
 	for _, lm := range m.LabelMatchers {
-		if err := lm.Init(); err != nil {
+		if err := lm.init(); err != nil {
 			return err
 		}
 	}
@@ -160,9 +149,6 @@ func (m *MetricDeclaration) MatchesLabels(labels map[string]string) bool {
 // returns dimensions that only contains labels from in the given label set.
 func (m *MetricDeclaration) ExtractDimensions(labels map[string]string) (dimensions [][]string) {
 	for _, dimensionSet := range m.Dimensions {
-		if len(dimensionSet) == 0 {
-			continue
-		}
 		includeSet := true
 		for _, dim := range dimensionSet {
 			if _, ok := labels[dim]; !ok {
@@ -177,8 +163,8 @@ func (m *MetricDeclaration) ExtractDimensions(labels map[string]string) (dimensi
 	return
 }
 
-// Init LabelMatcher with default values and compile regex string.
-func (lm *LabelMatcher) Init() (err error) {
+// init LabelMatcher with default values and compile regex string.
+func (lm *LabelMatcher) init() (err error) {
 	// Throw error if no label names are specified
 	if len(lm.LabelNames) == 0 {
 		return errors.New("label matcher must have at least one label name specified")
@@ -189,8 +175,9 @@ func (lm *LabelMatcher) Init() (err error) {
 	if len(lm.Separator) == 0 {
 		lm.Separator = ";"
 	}
-	lm.compiledRegex = regexp.MustCompile(lm.Regex)
-	return
+
+	lm.compiledRegex, err = regexp.Compile(lm.Regex)
+	return err
 }
 
 // Matches returns true if given set of labels matches the LabelMatcher's rules.
